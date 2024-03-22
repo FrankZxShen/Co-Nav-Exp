@@ -320,7 +320,7 @@ def Objects_Extract(full_map_pred):
                     cv2.polylines(dst, [approx], True, 1)
             if len(Single_object_list) > 0:
                 Object_list[hm3d_category[i]] = Single_object_list
-    print("Object_list: ",Object_list)
+    # print("Object_list: ",Object_list)
     return Object_list
 
 def form_prompt_for_chatgpt(goal_name, pose_pred, object_list, Wall_list, Frontier_list, last_decision, Frontier_points):
