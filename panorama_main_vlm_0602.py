@@ -18,6 +18,7 @@ from PIL import Image, ImageDraw, ImageFont
 import quaternion
 import pickle
 import io
+import re
 
 from skimage import measure
 import skimage.morphology
@@ -180,7 +181,7 @@ def main():
         while not env.episode_over:
             if agent[0].l_step % args.num_local_steps == args.num_local_steps - 1 or agent[0].l_step == 0:
                 goal_points.clear()
-                rgb_panorama = [] # 用于保存每个智能体的全景图
+                all_rgb = [] # 用于保存每个智能体的
                 all_objs = [] # 记录每个时间步每个智能体的目标检测信息
                 all_VLM_Pred = [] # 记录每个时间步中每个智能体的VLM预测结果
                 all_VLM_PR = [] # 记录每个时间步中每个智能体的PR分数
@@ -197,13 +198,13 @@ def main():
                 # while agent[0].l_step < 25:
                 #     goal_points = [[275, 288]]
 
-                #     action = [0]
-                #     pose_pred = []
+                    # action = [0]
+                    # pose_pred = []
                     # full_map = []
                     # visited_vis = []
                     # for i in range(num_agents):
                     #     agent[i].mapping(observations[i])
-                        # local_map1, _ = torch.max(agent[i].local_map.unsqueeze(0), 0)
+                    #     local_map1, _ = torch.max(agent[i].local_map.unsqueeze(0), 0)
                         # full_map.append(agent[i].local_map)
                         # visited_vis.append(agent[i].visited_vis)
                         # start_x, start_y, start_o, gx1, gx2, gy1, gy2 = agent[i].planner_pose_inputs
@@ -220,8 +221,7 @@ def main():
                     
                     # # full_map2 = torch.cat((full_map[0].unsqueeze(0), full_map[1].unsqueeze(0)), 0)
                     # full_map2 = torch.cat([fm.unsqueeze(0) for fm in full_map], dim=0)
-                    # full_map2 = full_map[0].unsqueeze(0)
-                    # logging.info(f"full_map2: {full_map2.shape}") #[x,20,480,480]
+                    # # logging.info(f"full_map2: {full_map2.shape}") #[x,20,480,480]
 
                     # full_map_pred, _ = torch.max(full_map2, 0)
                     # Wall_list, Frontier_list, target_edge_map, target_point_map = Frontiers(full_map_pred)
@@ -229,15 +229,22 @@ def main():
 
                     # for i in range(num_agents):
                     #     action[i] = agent[i].act(goal_points[i], False)
-                
-                    # observations = env.step(action)
-                    # if args.visualize or args.print_images: 
-                    #     Visualize(args, agent[0].episode_n, agent[0].l_step, pose_pred, full_map_pred, 
-                    #                 agent[0].goal_id, visited_vis, target_edge_map, goal_points)
-                
+                    
+                    # if len(target_point_map) > 0:
+                    #     Frontiers_dict = {}
+                    #     for j in range(len(target_point_map)):
+                    #         Frontiers_dict['frontier_' + str(j)] = f"<centroid: {target_point_map[j][0], target_point_map[j][1]}, number: {Frontier_list[j]}>"
+                    # logging.info(f'=====> Exit Frontier: {Frontiers_dict}')
+                #     observations = env.step(action)
+                #     if args.visualize or args.print_images: 
+                #         Visualize(args, agent[0].episode_n, agent[0].l_step, pose_pred, full_map_pred, 
+                #                     agent[0].goal_id, visited_vis, target_edge_map, Frontiers_dict, goal_points)
+                # exit(0)
                 for ags in range(360 // args.turn_angle): # 旋转
                     action = []
+                    returnsteps = []
                     for j in range(num_agents):
+                        returnsteps.append(0)
                         action.append(0)
                     full_map = []
                     visited_vis = []
@@ -266,7 +273,8 @@ def main():
                         if agent[i].Max_Perception_Angle != 360 or agent[i].Perception_PR != 0:
                             continue
                         rgb = observations[i]['rgb'].astype(np.uint8)
-                        rgb_panorama.append(rgb)
+                        all_rgb.append(rgb)
+                        # rgb_panorama.append(rgb)
                         # save panorama map
                         # plt.imsave(
                         #     os.path.join("{}/dump/agent_{}_{}_obs.png".format(args.dump_location, i, count_rotating)), 
@@ -405,7 +413,6 @@ def main():
                             else:
                                 agent[i].Perception_PR = all_VLM_PR[ags][f"Agent_{i}-Angle_{(ags)*args.turn_angle}-VLM_PerceptionPR"][0]
                     
-                    
                     ##### 没有达到退出条件，继续转
                     if all_agents_exit_false(agent):
                         goal_points.clear()
@@ -421,9 +428,7 @@ def main():
                     ##### 部分达到退出条件，先执行退出的，再回转没有退出的
                     else:
                         goal_points.clear()
-                        returnsteps = []
                         for i in range(num_agents):
-                            returnsteps.append(0)
                             # if agent[i].Max_Perception_Angle != 360 or agent[i].Perception_PR != 0:
                             #     continue
                             #### 达到退出条件->不用回转->刚好PR最高的是退出点
@@ -552,7 +557,7 @@ def main():
 
                 if args.visualize or args.print_images: 
                     Visualize(args, agent[0].episode_n, agent[0].l_step, pose_pred, full_map_pred, 
-                                agent[0].goal_id, visited_vis, target_edge_map, goal_points)
+                                agent[0].goal_id, visited_vis, target_edge_map, Frontiers_dict, goal_points)
             
             exit(0)
 
@@ -812,7 +817,8 @@ def Frontiers(full_map_pred):
 
     return Wall_lines, Goal_area_list, Goal_edge, Goal_point
 
-def Visualize(args, episode_n, l_step, pose_pred, full_map_pred, goal_name, visited_vis, map_edge, goal_points):
+# 画出所有的Frontier
+def Visualize(args, episode_n, l_step, pose_pred, full_map_pred, goal_name, visited_vis, map_edge, Frontiers_dict, goal_points):
     dump_dir = "{}/dump/{}/".format(args.dump_location,
                                     args.exp_name)
     ep_dir = '{}/episodes/eps_{}/'.format(
@@ -885,7 +891,7 @@ def Visualize(args, episode_n, l_step, pose_pred, full_map_pred, goal_name, visi
             goal_mask = goal_mat == 1
 
             sem_map[goal_mask] = 3 + i
-
+    
 
     color_pal = [int(x * 255.) for x in color_palette]
     sem_map_vis = Image.new("P", (sem_map.shape[1],
@@ -911,11 +917,28 @@ def Visualize(args, episode_n, l_step, pose_pred, full_map_pred, goal_name, visi
 
     vis_image[50:530, 15:495] = sem_map_vis
 
+    color_black = (0,0,0)
+    pattern = r'<centroid: (.*?), (.*?), number: (.*?)>'
+    alpha = [chr(ord("A") + i) for i in range(26)]
+    alpha0 = 0
+    
+    for keys, value in Frontiers_dict.items():
+        match = re.match(pattern, value)
+        if match:
+            centroid_x = int(match.group(1)[1:])
+            centroid_y = int(match.group(2)[:-1])
+            number = float(match.group(3))
+            # print(f"Centroid: ({centroid_x}, {centroid_y})")
+            # print(f"Number: {number}")
+            cv2.circle(vis_image, (centroid_x+28, centroid_y-35), 5, color_black, -1)
+            label = f"{alpha[alpha0]} {number}"
+            alpha0 += 1
+            cv2.putText(vis_image, label, (centroid_x+28+5, centroid_y-35+5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_black, 1)
+
     for i in range(args.num_agents):
         agent_arrow = vu.get_contour_points(pose_pred[i], origin=(15, 50), size=10)
 
         cv2.drawContours(vis_image, [agent_arrow], 0, color[i], -1)
-
     if args.visualize:
         # Displaying the image
         cv2.imshow("episode_n {}".format(episode_n), vis_image)
