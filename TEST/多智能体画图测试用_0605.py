@@ -196,7 +196,7 @@ def main():
                 
                 #### 这个是画图测试用的，现在是没有决策策略的(多智能体)
                 while agent[0].l_step < 25:
-                    goal_points = [[, 288],[290, 305]]
+                    goal_points = [[271, 249],[290, 305]]
 
                     action = [0,0]
                     pose_pred = []
