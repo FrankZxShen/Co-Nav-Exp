@@ -4,7 +4,7 @@ You are a robot that is exploring an indoor environment. Given the following inf
 
 Target of navigation: format-[Name]
 
-Scene object (object detection): format-[Name, Confidence Score, Coordinates of the Bounding Box (The Upper left and lower right corners) <(x1, y1), (x2, y2)>]
+Scene object (object detection): shif
 
 Scene object (semantic segmentation): format-[Name, Boundary Coordinates defined by vertices in clockwise order <(x1, y1), (x2, y2)...>]
 
@@ -25,7 +25,7 @@ You are a knowledgeable and skilled expert in indoor navigation planning. You ar
 (3) Scene exploration and analysis module: This module records the exploration possibility of current and historical navigation scenes. This module is especially useful when you are not clear about the exploration possibilities of semantic graphs.
 Your task is: based on the capabilities of each module, assign specific tasks as needed to gather the additional information needed to accurately answer the question.
 
-Your output format is as follows:
+Your output format is SIMPLY as follows **WITHOUT ANY OTHER WORDS**:
 
 Tasks of the module:
 (1) Scene image description module: [If necessary, please return Yes. Otherwise, return No.]
@@ -34,7 +34,7 @@ Tasks of the module:
 
 Make sure your answers fit into this format, using available modules or appropriate direct analysis to systematically address the question.
 
-**Here are some EXAMPLES:**
+**Here are some RIGHT EXAMPLES:**
 Example 1:
 (1) Scene image description module: No
 (2) Scene object detection module: No
@@ -83,6 +83,7 @@ Example 9:
 '''
 
 Module_Decision_Prompt = '''
+You are an advanced semantic understanding agent, and you need to focus on the semantic information of the scene image on the right. Your task is: 
 
 '''
 
@@ -210,11 +211,121 @@ def form_prompt_for_DecisionVLM_single(target, cur_location, Frontier_list) -> s
 
     return User_Prompt
 
+
+def extract_scene_image_description_results(text):
+    pattern = re.compile(r'Scene image description module: (Yes|No)',re.I)
+    matches = pattern.findall(text)
+    return matches
+def extract_scene_object_detection_results(text):
+    pattern = re.compile(r'Scene object detection module: (Yes|No)',re.I)
+    matches = pattern.findall(text)
+    return matches
+def extract_scenario_exploration_analysis_results(text):
+    pattern = re.compile(r'Scenario exploration analysis module: (Yes|No)',re.I)
+    matches = pattern.findall(text)
+    return matches
+
 def form_prompt_for_DecisionVLM_MetaPreprocess() -> str:
     return Meta_Agent_Preprocess_Prompt
 
+def form_prompt_for_Module_Decision(target, Preprocess_prompt, objs) -> str:
+    Use_prompt = ''
+    object_detection = ''
+    for item in objs:
+        name, confidence, coords = item
+        coord_pairs = coords[0].split(',')
+        coord1 = coord_pairs[0], coord_pairs[1]
+        coord2 = coord_pairs[2], coord_pairs[3]
+        detection = f"{name}: {confidence}, <({int(float(coord1[0]))}, {int(float(coord1[1]))}), ({int(float(coord2[0]))}, {int(float(coord2[1]))})>\n"
+        object_detection += detection
+    task_prompt_decription = '''
+Provide a detailed description of the scene image on the right. Requirements include, but are not limited to, the main content of the image, the objects present, the environment (such as living room, bedroom, etc.), and possible potential indoor objects. Please note that the description should be detailed enough for someone who has not seen the image to have a clear visual perception of your explanation.
+
+'''
+
+    task_prompt_detection = '''
+This is the object detection results for the right scene image in the format - [Name, Confidence Score, Coordinates of the Bounding Box (The Upper left and lower right corners) <(x1, y1), (x2, y2)>]:
+{OBJECT_DETECTION}
+Considering the existing object recognition results and the right scene image, list the names of all recognizable objects of the image. Be sure to rank these objects by predicted confidence or importance and briefly describe each object and its context.
+
+'''
+
+    task_prompt_analysis = '''
+Please analyze the following elements based on the image: 1. the spatial layout and passable areas; 2. any potential obstacles; and 3. identify which areas may contain critical information or objects based on the current mission objectives {TARGET}. In conjunction with the above analysis, assess whether the areas in the image are worth exploring further and give your reasons for your recommendation.
+
+'''
+    des = ", ".join(extract_scene_image_description_results(Preprocess_prompt))
+    det = ", ".join(extract_scene_object_detection_results(Preprocess_prompt))
+    ana = ", ".join(extract_scenario_exploration_analysis_results(Preprocess_prompt))
+    is_description = True if 'yes' in des.lower() else False
+    is_detection = True if 'yes' in det.lower() else False
+    is_analysis = True if 'yes' in ana.lower()  else False
+    
+    if is_description and not is_detection and not is_analysis:
+        end_prompt = '''
+Your output format is as follows:
+(1) scene image description: [Input your scene image description]
+'''
+        Use_prompt = Module_Decision_Prompt + '(1) ' + task_prompt_decription + end_prompt
+    elif is_detection and not is_description and not is_analysis:
+        end_prompt = '''
+Your output format is as follows:
+(1) scene image object detection: [Input your scene image object detection]
+'''
+        Use_prompt = Module_Decision_Prompt + '(1) ' + task_prompt_detection.format(OBJECT_DETECTION=object_detection)
+    elif is_analysis and not is_description and not is_detection:
+        end_prompt = '''
+Your output format is as follows:
+(1) rationale for scene exploration: [Input your rationale for scene exploration]
+'''
+        Use_prompt = Module_Decision_Prompt + '(1) ' + task_prompt_analysis.format(TARGET=target)
+    elif is_description and is_detection and not is_analysis:
+        end_prompt = '''
+Your output format is as follows:
+(1) scene image description: [Input your scene image description]
+(2) scene image object detection: [Input your scene image object detection]
+'''     
+        Use_prompt = Module_Decision_Prompt + '(1) ' + task_prompt_decription + \
+            '(2) ' + task_prompt_detection.format(OBJECT_DETECTION=object_detection) + end_prompt
+    elif is_description and is_analysis and not is_detection:
+        end_prompt = '''
+Your output format is as follows:
+(1) scene image description: [Input your scene image description]
+(2) rationale for scene exploration: [Input your rationale for scene exploration]
+'''   
+        Use_prompt = Module_Decision_Prompt + '(1) ' + task_prompt_decription + \
+            '(2) ' + task_prompt_analysis.format(TARGET=target) + end_prompt
+    elif is_detection and not is_analysis and not is_description:    
+        end_prompt = '''
+Your output format is as follows:
+(1) scene image object detection: [Input your scene image object detection]
+(2) rationale for scene exploration: [Input your rationale for scene exploration]
+'''   
+        Use_prompt = Module_Decision_Prompt + '(1) ' + task_prompt_detection.format(OBJECT_DETECTION=object_detection) + \
+            '(2) ' + task_prompt_analysis.format(TARGET=target) + end_prompt
+    elif is_detection and is_analysis and is_description:
+        end_prompt = '''
+Your output format is as follows:
+(1) scene image description: [Input your scene image description]
+(2) scene image object detection: [Input your scene image object detection]
+(3) rationale for scene exploration: [Input your rationale for scene exploration]
+'''     
+        Use_prompt = Module_Decision_Prompt + '(1) ' + task_prompt_decription + \
+            '(2) ' + task_prompt_detection.format(OBJECT_DETECTION=object_detection) + \
+                '(3) ' + task_prompt_analysis.format(TARGET=target) + end_prompt
+    else:
+        ### 跳过Module Prompt这一阶段
+        Use_prompt = None
+    
+    return Use_prompt    
+
+
+
+
 def form_prompt_for_DecisionVLM_Meta() -> str:
     return Meta_Agent_Decision_Prompt
+
+
 
 
 
