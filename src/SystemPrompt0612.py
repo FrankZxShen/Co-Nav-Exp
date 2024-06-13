@@ -285,51 +285,51 @@ Consider the spatial layout and passable areas, any potential obstacles based on
     if is_description and not is_detection and not is_analysis:
         end_prompt = '''
 Your output format is as follows:
-(1) scene image description: [Input your scene image description]
+(1) scene image description: <Input your scene image description>
 '''
         Use_prompt = Module_Decision_Prompt + '(1) ' + task_prompt_decription + end_prompt
     elif is_detection and not is_description and not is_analysis:
         end_prompt = '''
 Your output format is as follows:
-(1) scene image object detection: [Input your scene image object detection]
+(1) scene image object detection: <Input your scene image object detection>
 '''
         Use_prompt = Module_Decision_Prompt + '(1) ' + task_prompt_detection.format(OBJECT_DETECTION=object_detection)
     elif is_analysis and not is_description and not is_detection:
         end_prompt = '''
 Your output format is as follows:
-(1) rationale for scene exploration: [Input your rationale for scene exploration]
+(1) rationale for scene exploration: <Input your rationale for scene exploration>
 '''
         Use_prompt = Module_Decision_Prompt + '(1) ' + task_prompt_analysis.format(TARGET=target)
     elif is_description and is_detection and not is_analysis:
         end_prompt = '''
 Your output format is as follows:
-(1) scene image description: [Input your scene image description]
-(2) scene image object detection: [Input your scene image object detection]
+(1) scene image description: <Input your scene image description>
+(2) scene image object detection: <Input your scene image object detection>
 '''     
         Use_prompt = Module_Decision_Prompt + '(1) ' + task_prompt_decription + \
             '(2) ' + task_prompt_detection.format(OBJECT_DETECTION=object_detection) + end_prompt
     elif is_description and is_analysis and not is_detection:
         end_prompt = '''
 Your output format is as follows:
-(1) scene image description: [Input your scene image description]
-(2) rationale for scene exploration: [Input your rationale for scene exploration]
+(1) scene image description: <Input your scene image description>
+(2) rationale for scene exploration: <Input your rationale for scene exploration>
 '''   
         Use_prompt = Module_Decision_Prompt + '(1) ' + task_prompt_decription + \
             '(2) ' + task_prompt_analysis.format(TARGET=target) + end_prompt
     elif is_detection and not is_analysis and not is_description:    
         end_prompt = '''
 Your output format is as follows:
-(1) scene image object detection: [Input your scene image object detection]
-(2) rationale for scene exploration: [Input your rationale for scene exploration]
+(1) scene image object detection: <Input your scene image object detection>
+(2) rationale for scene exploration: <Input your rationale for scene exploration>
 '''   
         Use_prompt = Module_Decision_Prompt + '(1) ' + task_prompt_detection.format(OBJECT_DETECTION=object_detection) + \
             '(2) ' + task_prompt_analysis.format(TARGET=target) + end_prompt
     elif is_detection and is_analysis and is_description:
         end_prompt = '''
 Your output format is as follows:
-(1) scene image description: [Input your scene image description]
-(2) scene image object detection: [Input your scene image object detection]
-(3) rationale for scene exploration: [Input your rationale for scene exploration]
+(1) scene image description: <Input your scene image description>
+(2) scene image object detection: <Input your scene image object detection>
+(3) rationale for scene exploration: <Input your rationale for scene exploration>
 '''     
         Use_prompt = Module_Decision_Prompt + '(1) ' + task_prompt_decription + \
             '(2) ' + task_prompt_detection.format(OBJECT_DETECTION=object_detection) + \
