@@ -1118,8 +1118,7 @@ def main():
                             if FN_PR[0] >= 0.50:
                                 logging.info(f"VLM Choice: Agent_{j}-frontier_{Choice}")
                                 if len(full_Frontiers_dict) == 1:
-                                    for i, key in enumerate(frontier_keys):
-                                        goal_points[j] = [int(x) for x in full_Frontiers_dict[key].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
+                                    goal_points[j] = [int(x) for x in full_Frontiers_dict['frontier_0'].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
                                 else:
                                     if j > 0:
                                         for keys in range(len(missing_key_F)):
