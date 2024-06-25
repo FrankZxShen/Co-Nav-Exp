@@ -124,7 +124,7 @@ Now we begin:
 """
 ### F/N
 FN_System_Prompt = '''
-If the current scene is worth exploring, you should prioritize exploring frontier points. If the current scene is not worth exploring, you should consider revisiting historical observation points. Based on the current top-down semantic map of an indoor environment provided (The left part of the image), you will see various points marked as either 'frontier points' or 'historical observation points'. Frontier points represent unexplored areas that the robot has yet to navigate, while historical observation points signify areas the robot has previously explored or observed.
+{ISWORTH} Based on the current top-down semantic map of an indoor environment provided (The left part of the image), you will see various points marked as either 'frontier points' or 'historical observation points'. Frontier points represent unexplored areas that the robot has yet to navigate, while historical observation points signify areas the robot has previously explored or observed.
 Given the following information format:
 Frontier Points (The black dots and corresponding black uppercase letters on the left image):
 format-<Name: [Coordinates: <semantic map coordinates>]>
@@ -188,7 +188,9 @@ Your choice must be in 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l
 
 
 
-
+# '''
+# If the current scene is worth exploring, you should prioritize exploring frontier points. If the current scene is not worth exploring, you should consider revisiting historical observation points.
+# '''
 
 
 # 废弃
@@ -266,7 +268,7 @@ Are you confident that the robot is worth exploring in this scenario? You only n
 
     return User_Prompt
 
-def form_prompt_for_FN(pre_goal_point, Frontier_list, cur_location, History_nodes) -> str:
+def form_prompt_for_FN(Perception_PR, pre_goal_point, Frontier_list, cur_location, History_nodes) -> str:
 
     def convert_entry(entry):
         # 从字符串中提取坐标
@@ -299,8 +301,14 @@ def form_prompt_for_FN(pre_goal_point, Frontier_list, cur_location, History_node
             His_results += '\n'
     else:
         His_results = 'No historical observation points'
+    
 
+    if Perception_PR[0] >= 0.50:
+        isworth = 'The current scene is worth exploring.'
+    else:
+        isworth = 'The current scene is not worth exploring.'
     User_Prompt = FN_System_Prompt.format(
+                        ISWORTH = isworth,
                         FRONTIERS_RESULTS = Frontiers_results,
                         HISTORY_NODES = His_results,
                         CUR_LOCATION = cur_location,
@@ -518,11 +526,11 @@ def Perception_weight_decision(VLM_Rel: list, VLM_Pred: str) -> str:
     x, y = VLM_Rel
     
     if b_decision == "Yes":
-        weighted_yes_prob = x
+        weighted_yes_prob = x * 2
         weighted_no_prob = y * (1 - x)
     else:  # b_decision == "No"
         weighted_yes_prob = x * (1 - y)
-        weighted_no_prob = y
+        weighted_no_prob = y * 2
     
     total_prob = weighted_yes_prob + weighted_no_prob
     if total_prob == 0:  # 避免划分零的问题
