@@ -1109,7 +1109,7 @@ def main():
                                                             # return_string_probabilities="[a, b, c, d]", img=full_rgb)
                                 # Decisions.append(Meta_Choice)
                                 # Final_PR = Perception_weight_decision26(Meta_Score, Meta_Choice)
-                                Final_PR = history_score_copy()
+                                Final_PR = history_score_copy
 
                             logging.info(f"Agent_{j}--Final_PR: {Final_PR}")
 
@@ -1123,9 +1123,8 @@ def main():
                                         goal_points[j] = [int(x) for x in full_Frontiers_dict[key].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
                                 else:
                                     frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2', 'frontier_3']
-                                    if j > 0:
-                                        for keys in range(len(missing_key_F)):
-                                            del frontier_keys[keys]
+                                    for keys in range(len(missing_key_F)):
+                                        del frontier_keys[keys]
                                     for i, key in enumerate(frontier_keys):
                                         if Choice == i:
                                             goal_points[j] = [int(x) for x in full_Frontiers_dict_copy[key].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
