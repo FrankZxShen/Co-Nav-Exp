@@ -125,52 +125,64 @@ Now we begin:
 ### F/N
 FN_System_Prompt = '''
 If the current scene is worth exploring, you should prioritize exploring frontier points. If the current scene is not worth exploring, you should consider revisiting historical observation points. Based on the current top-down semantic map of an indoor environment provided (The left part of the image), you will see various points marked as either 'frontier points' or 'historical observation points'. Frontier points represent unexplored areas that the robot has yet to navigate, while historical observation points signify areas the robot has previously explored or observed.
-
-frontier points (The black dots and corresponding black uppercase letters on the left image):
-{FRONTIERS_RESULTS}
-historical observation points (The green dots and corresponding green numbers on the left image)
-{HISTORY_NODES}
-The arrow is your location: {CUR_LOCATION}.
-
+Given the following information format:
+Frontier Points (The black dots and corresponding black uppercase letters on the left image):
+format-<Name: [Coordinates: <semantic map coordinates>]>
+Historical Observation Points (The green dots and corresponding green lowercase letters on the left image):
+format-<Name: [Coordinates: <semantic map coordinates>]>
+The Arrow (Your location): format-<semantic map coordinates>
+Previous Movement: format-<semantic map coordinates>
+You need to guide the robot for exploration purposes based on the relationship between different objects, the structure of the explored area, the robot's position, the proximity of the exploration point, and the direction of previous movement.
 Would you recommend:
 A) Explore a frontier point? If so, answer ONLY Yes.
 
 B) Revisit a historical observation point? If so, answer ONLY No.
-Your Answer MUST in 'Yes', 'No' **WITHOUT ANY OTHER DESCRIPTION**. You don't need to add punctuation at the end. You only need to answer 'Yes' or 'No'.
+
+Now we begin:
+Frontier Points (The black dots and corresponding black uppercase letters on the left image):
+{FRONTIERS_RESULTS}
+Historical Observation Points (The green dots and corresponding green lowercase letters on the left image):
+{HISTORY_NODES}
+The Arrow: {CUR_LOCATION}.
+Previous Movement: {PRE}
+
+Your Answer MUST in 'Yes', 'No' **WITHOUT ANY OTHER DESCRIPTION**. You don't need to add punctuation at the end. You don't need to add space at the beginning. 
 '''
 
 ### 决策1
 Single_Agent_Decision_Prompt_Frontier = '''
-Your choice is 'frontier points'. So you will now explore the frontiers in this indoor environment.
+Your choice is 'Frontier Points'. So you will now explore the frontiers in this indoor environment.
 
-The black dots and corresponding uppercase letters on the left image represent the Frontiers awaiting your exploration: 
+The black dots and corresponding uppercase letters on the left image represent the Frontier Points awaiting your exploration: 
 {FRONTIERS_RESULTS}
-The arrow is your location: [[Coordinates: {CUR_LOCATION}].
+The Arrow is Your Location: {CUR_LOCATION}.
+Previous Movement: {PRE}
 
 Your goal is to find the {TARGET}. You need to consider the following factors:
-(1) Consider the proximity and accessibility of the frontier. You need to consider the proximity and accessibility of the front and your location. Frontiers that are closer and without barriers tend to have a higher exploration priority. 
+(1) Consider the proximity and accessibility of the frontier. You need to consider the proximity and accessibility of the front and your previous movement. Frontiers that are closer and without barriers tend to have a higher exploration priority. 
 (2) Consider the objects in the scene. Use your knowledge of the location of typical objects (e.g., the bed in your bedroom, the TV in your living room) to assess the likelihood of finding the target object.
-(3) Consider possible potential rooms in the scene. Areas in the scene image may lead to different rooms, and navigation targets may be located in different rooms. For example, the appearance of a door in the image may indicate that the target object may be located in a potential room behind the door, which makes the corresponding frontier worth exploring.>
+(3) Minimize frequent switches between frontiers. You should maintain its exploration direction unless an efficient switch is evident.
 You need to comprehensively consider the relevance of the scene image and the top-down semantic map, and choose the navigation frontier for the next timestep based on their relationship with your navigation goal. 
 
-Your choice MUST in 'A', 'B', 'C', 'D' **WITHOUT ANY OTHER DESCRIPTION**. You don't need to add punctuation at the end. You only need to answer 'A', 'B', 'C' or 'D'.
+Your choice MUST in 'A', 'B', 'C', 'D' **WITHOUT ANY OTHER DESCRIPTION**. You don't need to add punctuation at the end. You don't need to add space at the beginning. 
 '''
 ### 决策2
 Single_Agent_Decision_Prompt_History = '''
-Your choice is 'historical observation points'. So you will now re-explore historical nodes in this indoor environment. 
+Your choice is 'Historical Observation Points'. So you will now re-explore historical nodes in this indoor environment. 
 
-The green dots and corresponding green numbers on the left image represent the historical observation points awaiting your exploration: 
+The green dots and corresponding green lowercase letters on the left image represent the Historical Observation Points awaiting your exploration: 
 {HISTORY_NODES}
-where the confidence level following each number represents the exploration likelihood that this point was recorded. Point with higher confidence have higher exploration priority.
-The arrow is your location: [[Coordinates: {CUR_LOCATION}].
+where the confidence level following each green lowercase letter represents the exploration likelihood that this point was recorded. Point with higher confidence have higher exploration priority.
+The Arrow is Your Location: {CUR_LOCATION}
+Previous Movement: {PRE}
 
 Your goal is to find the {TARGET}. You need to consider the following factors:
-(1) Consider the proximity and accessibility of the points. You need to consider the proximity and accessibility of the front and your location. Points that are closer and without barriers tend to have a higher exploration priority. 
+(1) Consider the proximity and accessibility of the points. You need to consider the proximity and accessibility of the front and your previous movement. Points that are closer and without barriers tend to have a higher exploration priority. 
 (2) Consider the objects in the scene. Use your knowledge of the location of typical objects (e.g., the bed in your bedroom, the TV in your living room) to assess the likelihood of finding the target object.
-(3) Consider possible potential rooms in the scene. Areas in the scene image may lead to different rooms, and navigation targets may be located in different rooms. For example, the appearance of a door in the image may indicate that the target object may be located in a potential room behind the door, which makes the corresponding point worth exploring.>
+(3) Minimize frequent switches between points. Use centroid for frontier selection. You should maintain its exploration direction unless an efficient switch is evident.
 You need to comprehensively consider the relevance of the scene image and the top-down semantic map, and choose the navigation point for the next timestep based on their relationship with your navigation goal. 
 
-Your choice must be in '1', '2', '3', '4', ... or '26' and 26 other numbers representing historical observation points  **WITHOUT ANY OTHER DESCRIPTION**. You don't need to add punctuation at the end. You only need to answer '1', '2', '3', '4',... or '26' and 26 other numbers.
+Your choice must be in 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z' and 26 other lowercase letters representing historical observation points  **WITHOUT ANY OTHER DESCRIPTION**. You don't need to add punctuation at the end. You don't need to add space at the beginning. 
 '''
 
 
@@ -213,18 +225,24 @@ def form_prompt_for_PerceptionVLM(target, objs, yolo) -> str:
 
     object_detection = ''
     if yolo == 'yolov9':
-        for item in objs:
-            name, confidence, coords = item
-            # coord_pairs = coords[0].split(',')
-            # coord1 = coord_pairs[0], coord_pairs[1]
-            # coord2 = coord_pairs[2], coord_pairs[3]
-            detection = f"{name}: {confidence})>\n"
-            object_detection += detection
+        if len(objs) < 1:
+            object_detection = 'No Detections'
+        else:
+            for item in objs:
+                name, confidence, coords = item
+                # coord_pairs = coords[0].split(',')
+                # coord1 = coord_pairs[0], coord_pairs[1]
+                # coord2 = coord_pairs[2], coord_pairs[3]
+                detection = f"{name}: {confidence})>\n"
+                object_detection += detection
     else:
         # print(objs)
-        for name, confidence in objs.items():
-            detection = f"<{name}: {confidence})>\n"
-            object_detection += detection
+        if len(objs) < 1:
+            object_detection = 'No Detections'
+        else:
+            for name, confidence in objs.items():
+                detection = f"<{name}: {confidence})>\n"
+                object_detection += detection
 
     # semantic_segmentation = "\n".join([f"{key}: " + ", ".join([f"<" + ", ".join([f"{value[i][j][0][0], value[i][j][0][1]}" 
     #                         for j in range(len(value[i]))]) + f">"
@@ -248,13 +266,16 @@ Are you confident that the robot is worth exploring in this scenario? You only n
 
     return User_Prompt
 
-def form_prompt_for_FN(Frontier_list, cur_location, History_nodes) -> str:
+def form_prompt_for_FN(pre_goal_point, Frontier_list, cur_location, History_nodes) -> str:
 
     def convert_entry(entry):
         # 从字符串中提取坐标
         centroid_str = entry.split('centroid: ')[1].split(', number: ')[0]
         number_str = entry.split('number: ')[1][:-1]
         return f'[Coordinates: {centroid_str}]'
+    
+    if all(num == 0 for num in pre_goal_point):
+        pre_goal_point = 'No Movements'
 
     # 遍历字典，并使用转换函数
     Frontiers = []
@@ -271,7 +292,7 @@ def form_prompt_for_FN(Frontier_list, cur_location, History_nodes) -> str:
     if len(History_nodes) > 0:
         History = []
         for i in range(len(History_nodes)):
-            History.append(f'{chr(65+i)}: [Coordinates: {History_nodes[i]}]') 
+            History.append(f'{chr(ord("a")+i)}: [Coordinates: {History_nodes[i]}]') 
         His_results = ''
         for i in range(len(History)):
             His_results += History[i]
@@ -283,18 +304,22 @@ def form_prompt_for_FN(Frontier_list, cur_location, History_nodes) -> str:
                         FRONTIERS_RESULTS = Frontiers_results,
                         HISTORY_NODES = His_results,
                         CUR_LOCATION = cur_location,
+                        PRE = pre_goal_point, 
                     )
 
 
     return User_Prompt
 
-def form_prompt_for_DecisionVLM_Frontier(target, cur_location, Frontier_list) -> str:
+def form_prompt_for_DecisionVLM_Frontier(pre_goal_point, target, cur_location, Frontier_list) -> str:
 
     def convert_entry(entry):
         # 从字符串中提取坐标和像素计数
         centroid_str = entry.split('centroid: ')[1].split(', number: ')[0]
         number_str = entry.split('number: ')[1][:-1]
         return f'[Coordinates: {centroid_str}]'
+
+    if all(num == 0 for num in pre_goal_point):
+        pre_goal_point = 'No Movements'
 
     # 遍历字典，并使用转换函数
     Frontiers = []
@@ -309,27 +334,30 @@ def form_prompt_for_DecisionVLM_Frontier(target, cur_location, Frontier_list) ->
         Frontiers_results += '\n'
     
     User_Prompt = Single_Agent_Decision_Prompt_Frontier.format(
+        FRONTIERS_RESULTS = Frontiers_results,
         TARGET = target,
         CUR_LOCATION = cur_location,
-        FRONTIERS_RESULTS = Frontiers_results
+        PRE = pre_goal_point, 
     )
     
 
     return User_Prompt
 
-def form_prompt_for_DecisionVLM_History(target, cur_location, confidence, History_nodes) -> str:
+def form_prompt_for_DecisionVLM_History(pre_goal_point, target, cur_location, confidence, History_nodes) -> str:
 
     # def convert_entry(entry):
     #     # 从字符串中提取坐标和像素计数
     #     centroid_str = entry.split('centroid: ')[1].split(', number: ')[0]
     #     number_str = entry.split('number: ')[1][:-1]
     #     return f'[Coordinates: {centroid_str}]'
-
+    
+    if all(num == 0 for num in pre_goal_point):
+        pre_goal_point = 'No Movements'
     # 遍历字典，并使用转换函数
     if len(History_nodes) > 0:
         History = []
         for i in range(len(History_nodes)):
-            History.append(f'{i+1}: [Coordinates: {History_nodes[i]}; Confidence: {confidence[i]}]') 
+            History.append(f'{chr(ord("a") + i)}: [Coordinates: {History_nodes[i]}; Confidence: {confidence[i]}]') 
         His_results = ''
         for i in range(len(History)):
             His_results += History[i]
@@ -340,6 +368,7 @@ def form_prompt_for_DecisionVLM_History(target, cur_location, confidence, Histor
     User_Prompt = Single_Agent_Decision_Prompt_History.format(
         TARGET = target,
         CUR_LOCATION = cur_location,
+        PRE = pre_goal_point, 
         HISTORY_NODES = His_results
     )
     
@@ -531,6 +560,9 @@ def Perception_weight_decision4(VLM_Rel: list, VLM_Pred: str) -> str:
         "C": VLM_Rel[2],
         "D": VLM_Rel[3]
     }
+
+    # 加权权重
+    weights[decision] = weights[decision] * 4
     
     # 根據決策計算加權概率
     total_weight = sum(VLM_Rel)
@@ -544,7 +576,7 @@ def Perception_weight_decision4(VLM_Rel: list, VLM_Pred: str) -> str:
 
 
 def contains_decision26(VLM_Pred: str) -> str:
-    for char in ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19', '20', '21', '22', '23', '24', '25', '26']:
+    for char in ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z']:
         if char in VLM_Pred:
             return char
     return "Neither"
@@ -556,12 +588,15 @@ def Perception_weight_decision26(VLM_Rel: list, VLM_Pred: str) -> dict:
     
     assert len(VLM_Rel) == 26, "VLM_Rel must contain weights for 26 decisions (1-26)."
     
-    weights = {str(i+1): VLM_Rel[i] for i in range(26)}  # Assign weights to each number
+    weights = {chr(ord("a")+i): VLM_Rel[i] for i in range(26)}  # Assign weights to each number
     
+    # 加权权重
+    weights[decision] = weights[decision] * 26
+
     total_weight = sum(VLM_Rel)
     if total_weight == 0:
         return {"Invalid weights provided.": 1.0}
 
-    weighted_probs = {key: val/total_weight for key, val in weights.items()}
+    weighted_probs = [val/total_weight for _, val in weights.items()]
     
     return weighted_probs
