@@ -1081,9 +1081,8 @@ def main():
                                 full_Frontiers_dict_copy = full_Frontiers_dict.copy()
                             else:
                                 missing_key_F = []
-                                # missing_index_H = []
                                 for element in full_Frontiers_dict.keys():
-                                    if element not in full_Frontiers_dict_copy:
+                                    if element not in full_Frontiers_dict_copy.keys():
                                         missing_key_F.append(element)
                                 # for element in history_nodes:
                                 #     if element not in history_nodes_copy:
@@ -1122,13 +1121,16 @@ def main():
                                     for i, key in enumerate(frontier_keys):
                                         goal_points[j] = [int(x) for x in full_Frontiers_dict[key].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
                                 else:
-                                    frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2', 'frontier_3']
-                                    for keys in range(len(missing_key_F)):
-                                        del frontier_keys[keys]
+                                    if j > 0:
+                                        for keys in range(len(missing_key_F)):
+                                            del frontier_keys[keys]
+                                    else:
+                                        frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2', 'frontier_3']
                                     for i, key in enumerate(frontier_keys):
                                         if Choice == i:
                                             goal_points[j] = [int(x) for x in full_Frontiers_dict_copy[key].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
                                             del full_Frontiers_dict_copy[key]
+                                                
                                             break
 
                             else:
