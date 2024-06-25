@@ -1020,7 +1020,7 @@ def main():
                                 pre_goal_points = goal_points
                             ### f/n 判断VLM
                             if len(history_nodes) > 0:
-                                FN_Prompt = form_prompt_for_FN(pre_goal_points[j], full_Frontiers_dict, start, history_nodes)
+                                FN_Prompt = form_prompt_for_FN(Perception_PR, pre_goal_points[j], full_Frontiers_dict, start, history_nodes)
                                 # logging.info(FN_Prompt)
                                 
                                 FN_Rel, FN_Decision = cogvlm2.COT2(User_Prompt1=VLM_Perception_Prompt, 
@@ -1121,8 +1121,8 @@ def main():
                                     goal_points[j] = [int(x) for x in full_Frontiers_dict['frontier_0'].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
                                 else:
                                     if j > 0:
-                                        for keys in range(len(missing_key_F)):
-                                            del frontier_keys[keys]
+                                        for keys in missing_key_F:
+                                            frontier_keys.remove(keys)
                                     else:
                                         frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2', 'frontier_3']
                                     for i, key in enumerate(frontier_keys):
