@@ -23,6 +23,10 @@ class Multi_Agent_Env(habitat.Env):
 
         super().__init__(config_env)
 
+        # Initializations
+        self.episode_no = 0
+   
+
     def reset(self):
         """Resets the environment to a new episode.
 
@@ -70,28 +74,28 @@ class Multi_Agent_Env(habitat.Env):
 
         return obs
 
-    def _preprocess_semantic(self, semantic):
-        # print("*********semantic type: ", type(semantic))
-        se = list(set(semantic.ravel()))
-        # print(se) # []
-        for i in range(len(se)):
-            if self.scene.objects[se[i]].category.name() in self.hm3d_semantic_mapping:
-                hm3d_category_name = self.hm3d_semantic_mapping[self.scene.objects[se[i]].category.name()]
-            else:
-                hm3d_category_name = self.scene.objects[se[i]].category.name()
+    # def _preprocess_semantic(self, semantic):
+    #     # print("*********semantic type: ", type(semantic))
+    #     se = list(set(semantic.ravel()))
+    #     # print(se) # []
+    #     for i in range(len(se)):
+    #         if self.scene.objects[se[i]].category.name() in self.hm3d_semantic_mapping:
+    #             hm3d_category_name = self.hm3d_semantic_mapping[self.scene.objects[se[i]].category.name()]
+    #         else:
+    #             hm3d_category_name = self.scene.objects[se[i]].category.name()
 
-            if hm3d_category_name in mp3d_category_id:
-                # print("sum: ", np.sum(sem_output[sem_output==se[i]])/se[i])
-                semantic[semantic==se[i]] = mp3d_category_id[hm3d_category_name]-1
-            else :
-                semantic[
-                    semantic==se[i]
-                    ] = 0
+    #         if hm3d_category_name in mp3d_category_id:
+    #             # print("sum: ", np.sum(sem_output[sem_output==se[i]])/se[i])
+    #             semantic[semantic==se[i]] = mp3d_category_id[hm3d_category_name]-1
+    #         else :
+    #             semantic[
+    #                 semantic==se[i]
+    #                 ] = 0
     
-        # se = list(set(semantic.ravel()))
-        # print("semantic: ", se) # []
-        semantic = np.expand_dims(semantic.astype(np.uint8), 2)
-        return semantic
+    #     # se = list(set(semantic.ravel()))
+    #     # print("semantic: ", se) # []
+    #     semantic = np.expand_dims(semantic.astype(np.uint8), 2)
+    #     return semantic
 
     def get_sim_location(self):
         """Returns x, y, o pose of the agent in the Habitat simulator."""
