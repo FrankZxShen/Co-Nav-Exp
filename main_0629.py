@@ -765,7 +765,7 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    device = torch.device("cuda:1" if args.cuda else "cpu")
+    device = torch.device("cuda:0" if args.cuda else "cpu")
 
     # logging.info(f"stride:{stride}")
     # logging.info(f"names:{names}")
@@ -1411,14 +1411,6 @@ def main():
 
 
                 # Local_Policy = 1
-                # 判断距离，如果互相太远就交换
-                if num_agents == 2:
-                    distance_g0_c0 = calculate_distance(goal_points[0], cur_goal_points[0])
-                    distance_g0_c1 = calculate_distance(goal_points[0], cur_goal_points[1])
-                    distance_g1_c1 = calculate_distance(goal_points[1], cur_goal_points[1])
-                    distance_g1_c0 = calculate_distance(goal_points[1], cur_goal_points[0])
-                    if distance_g0_c0 < distance_g0_c1 and distance_g1_c1 < distance_g1_c0:
-                        goal_points = [goal_points[1], goal_points[0]]
                 # 判断距离，如果两次间隔距离过短就选择随机点进行导航
                 for i in range(num_agents):
                     if len(pre_goal_points) > 0 and calculate_distance(pre_goal_points[i], cur_goal_points[i]) <= 2.5:
@@ -1431,6 +1423,14 @@ def main():
                         break
                     if calculate_distance(cur_goal_points[i], pre_g_points[i]) >= 10 and angle_score >= 1.0:
                         goal_points[i] = pre_g_points[i]
+                # 判断距离，如果互相太远就交换
+                if num_agents == 2:
+                    distance_g0_c0 = calculate_distance(goal_points[0], cur_goal_points[0])
+                    distance_g0_c1 = calculate_distance(goal_points[0], cur_goal_points[1])
+                    distance_g1_c1 = calculate_distance(goal_points[1], cur_goal_points[1])
+                    distance_g1_c0 = calculate_distance(goal_points[1], cur_goal_points[0])
+                    if distance_g0_c0 < distance_g0_c1 and distance_g1_c1 < distance_g1_c0:
+                        goal_points = [goal_points[1], goal_points[0]]
                 logging.info(f"goal_points: {goal_points}")
                 pre_g_points = goal_points
                 logging.info("===== Starting local strategy ===== ")
