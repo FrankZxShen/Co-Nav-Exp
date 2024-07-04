@@ -1533,7 +1533,7 @@ def main():
 
         log += ", ".join(k + ": {:.3f}".format(v / count_episodes) for k, v in agg_metrics.items() if k !='success') + " ---({:.0f}/{:.0f})".format(count_episodes, num_episodes)
 
-        log += "Total usage: " + str(sum(total_usage)) + ", average usage: " + str(np.mean(total_usage))
+        # log += "Total usage: " + str(sum(total_usage)) + ", average usage: " + str(np.mean(total_usage))
         print(log)
         logging.info(log)
         fn = '{}/TEST.log'.format(log_dir)
