@@ -1550,11 +1550,8 @@ def main():
                 for i in range(num_agents):
                     if agent[i].Find_Goal:
                         agg_metrics[k] += 1
-                        obj_SR[agent[0].goal_name] += 1
                         if agg_metrics[k] > count_episodes:
                             agg_metrics[k] = count_episodes
-                        if obj_SR[agent[0].goal_name] > obj_SR['num_'+agent[0].goal_name]:
-                            obj_SR[agent[0].goal_name] = obj_SR['num_'+agent[0].goal_name]
                         break
         spls = []
         for i in range(num_agents):
