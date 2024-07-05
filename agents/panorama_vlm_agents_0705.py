@@ -1,1579 +1,1136 @@
-from collections import deque, defaultdict
-from typing import Dict
-from itertools import count
-import os
-import logging
-import time
-import json
-import sys
-import gym
-import matplotlib.pyplot as plt
-import torch.nn as nn
-import torch
-import torch.optim as optim
-import numpy as np
-from torch.autograd import Variable
-import torch.nn.functional as F
-from PIL import Image, ImageDraw, ImageFont
-import quaternion
-import pickle
-import io
-import re
+#!/usr/bin/env python3
 
+# Copyright (c) Facebook, Inc. and its affiliates.
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+
+
+import argparse
+import os
+import re
+import random
+from typing import Dict, Optional
+import math
+import time
+import logging
+
+import numba
+import numpy as np
+import torch
+import torch.nn as nn
+import gym
+from torchvision import transforms
+import torch.nn.functional as F
+
+from habitat.core.agent import Agent
+from habitat.core.simulator import Observations
+
+from matplotlib import pyplot as plt
 from skimage import measure
 import skimage.morphology
 from PIL import Image
+from copy import deepcopy
+import numpy as np
 
-import math
 import cv2
-import habitat
-import habitat_sim
-from habitat.sims.habitat_simulator.actions import (
-    HabitatSimActions,
-    HabitatSimV1ActionSpaceConfiguration,
-)
 
-# from habitat_sim.utils.common import quat_to_coeffs, quat_from_angle_axis
-# from constants import coco_categories, color_palette, category_to_id
-from agents.panorama_vlm_agents import LLM_Agent
-# from agents.llm_agents import LLM_Agent
-from constants import (
-    color_palette, coco_categories, coco_categories_hm3d2mp3d,
-    hm3d_category, category_to_id, object_category
-)
-from envs.habitat.multi_agent_env_vlm import Multi_Agent_Env
-# from envs.habitat.multi_agent_env import Multi_Agent_Env
-
-# from src.habitat import (
-#     make_simple_cfg,
-#     pos_normal_to_habitat,
-#     pos_habitat_to_normal,
-#     pose_habitat_to_normal,
-#     pose_normal_to_tsdf,
-# )
-# from src.geom import get_cam_intr, get_scene_bnds
-from src.vlm import VLM, CogVLM2
-from src.SystemPrompt import (
-    form_prompt_for_PerceptionVLM, 
-    form_prompt_for_FN,
-    form_prompt_for_DecisionVLM_Frontier,
-    form_prompt_for_DecisionVLM_History,
-
-    form_prompt_for_DecisionVLM_MetaPreprocess,
-    form_prompt_for_Module_Decision,
-    Perception_weight_decision,
-    Perception_weight_decision4,
-    Perception_weight_decision26,
-    extract_scene_image_description_results,
-    extract_scene_object_detection_results,
-    extract_scenario_exploration_analysis_results
-)
-# from src.tsdf import TSDFPlanner
+from semantic_mapping import Semantic_Mapping
 import utils.pose as pu
-
+from utils.fmm_planner import FMMPlanner
+from utils.semantic_prediction import SemanticPredMaskRCNN
 import utils.visualization as vu
-
+from utils.visualization import save_legend
 from arguments import get_args
 
-##### 如果是安装了yolov9环境，请将其注释取消
-# from detect_yolov9 import Detect
-from detect.ultralytics import YOLOv10
+from constants import (
+    coco_categories, coco_categories_hm3d2mp3d,
+    gibson_coco_categories, color_palette, category_to_id, object_category
+)
+from RedNet.RedNet_model import load_rednet
+from constants import mp_categories_mapping
 
-@habitat.registry.register_action_space_configuration
-class PreciseTurn(HabitatSimV1ActionSpaceConfiguration):
-    def get(self):
-        config = super().get()
+# from Grounded_SAM.grounded_sam_demo import vis_semantics
+# from Grounded_SAM.gsam import GSAM, convert_SAM
+# from Grounded_SAM.grounded_sam_demo import load_model, get_grounding_output, save_mask_data, show_mask, show_box
 
-        config[HabitatSimActions.TURN_LEFT_S] = habitat_sim.ActionSpec(
-            "turn_left",
-            habitat_sim.ActuationSpec(amount=self.config.TURN_ANGLE_S),
-        )
-        config[HabitatSimActions.TURN_RIGHT_S] = habitat_sim.ActionSpec(
-            "turn_right",
-            habitat_sim.ActuationSpec(amount=self.config.TURN_ANGLE_S),
-        )
 
-        return config
+class LLM_Agent(Agent):
+    def __init__(self, args, agent_id, device) -> None:
+        self.args = args
+        self.agent_id = agent_id
+        print("args: ", args)
 
-# def get_explorable_areas(full_map_pred, count):
-#     # 获取可探索区域
-#     explorable_areas = cv2.inRange(full_map_pred[1].cpu().numpy(), 0.1, 1)
-    
-    # # 使用形态学闭运算填充小的空洞
-    # kernel = np.ones((5, 5), dtype=np.uint8)
-    # explorable_areas = cv2.morphologyEx(explorable_areas, cv2.MORPH_CLOSE, kernel)
-    
-    # # 创建一个新的地图，用于存储可探索区域
-    # explorable_map = np.zeros_like(full_map_pred[0].cpu().numpy())
-    
-    # # 在新地图上标记可探索区域
-    # explorable_map[explorable_areas == 255] = 1
+        self.t = 0 ###TEST
 
-    # color_map = np.zeros((explorable_map.shape[0], explorable_map.shape[1], 3), dtype=np.uint8)
-    
-    # # 将可探索区域标记为绿色
-    # color_map[explorable_map == 1] = [0, 255, 0]  # GR 值
-    
-    # # 显示彩色图像
-    # fn = f'Vis-explore_{count}.png'
-    # cv2.imwrite(fn, color_map)
-    
-    # return explorable_map
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        self.object_category = deepcopy(object_category)
 
-def Objects_Extract(args, full_map_pred, use_sam):
+        if args.cuda:
+            torch.cuda.manual_seed(args.seed)
 
-    semantic_map = full_map_pred[4:]
-
-    dst = np.zeros(semantic_map[0, :, :].shape)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(7, 7))
-
-    Object_list = {}
-    for i in range(len(semantic_map)):
-        if semantic_map[i, :, :].sum() != 0:
-            Single_object_list = []
-            se_object_map = semantic_map[i, :, :].cpu().numpy()
-            se_object_map[se_object_map>0.1] = 1
-            se_object_map = cv2.morphologyEx(se_object_map, cv2.MORPH_CLOSE, kernel)
-            contours, hierarchy = cv2.findContours(cv2.inRange(se_object_map,0.1,1), cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
-            for cnt in contours:
-                if len(cnt) > 30:
-                    epsilon = 0.05 * cv2.arcLength(cnt, True)
-                    approx = cv2.approxPolyDP(cnt, epsilon, True)
-                    Single_object_list.append(approx)
-                    cv2.polylines(dst, [approx], True, 1)
-            if len(Single_object_list) > 0:
-                if use_sam:
-                    Object_list[object_category[i]] = Single_object_list
-                else:
-                    if 'objectnav_mp3d' in args.task_config:
-                        Object_list[object_category[i]] = Single_object_list
-                    elif 'objectnav_hm3d' in args.task_config:
-                        Object_list[hm3d_category[i]] = Single_object_list
-    return Object_list
-
-def all_agents_exit_false(agents):
-    for agent in agents:
-        if agent.EXIT:
-            return False
-    return True
-
-def all_agents_exit_true(agents):
-    for agent in agents:
-        if not agent.EXIT:
-            return False
-    return True
-
-def ExtractExplorableAreas(full_map_pred, explo_area_map, VLM_PR, VLM_PR_last, color_map, count):
-    PR = VLM_PR[0]
-
-    # kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    full_w = full_map_pred.shape[1]
-
-    # local_ob_map = cv2.dilate(full_map_pred[0].cpu().numpy(), kernel)
-    show_ex = cv2.inRange(full_map_pred[1].cpu().numpy(), 0.1, 1)
-
-    kernel = np.ones((5, 5), dtype=np.uint8)
-    free_map = cv2.morphologyEx(show_ex, cv2.MORPH_CLOSE, kernel)
-
-    contours, _ = cv2.findContours(free_map, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    local_ob_map = cv2.dilate(full_map_pred[0].cpu().numpy(), kernel)
-    explo_area_map_cur = np.zeros_like(local_ob_map)
-
-    if len(contours) > 0:
-        for contour in contours:
-            if cv2.contourArea(contour) > 4: # 示例中将面积极小的区域排除
-                cv2.drawContours(explo_area_map_cur, [contour], -1, PR, -1) # 填充内部为PR
-
-    # 清除边界部分
-    explo_area_map_cur[0:2, 0:full_w] = 0
-    explo_area_map_cur[full_w-2:full_w, 0:full_w] = 0
-    explo_area_map_cur[0:full_w, 0:2] = 0
-    explo_area_map_cur[0:full_w, full_w-2:full_w] = 0
-
-    if VLM_PR_last:
-        # mask = np.logical_and(explo_area_map_cur != PR, explo_area_map == VLM_PR_last[0])
-        coords = np.where(explo_area_map != 0)
-        # PR_coords = list(zip(coords[0], coords[1]))
-        explo_area_map_cur[coords] = explo_area_map[coords]
-
-    
-    # 将可探索区域标记为当前颜色
-    intensity = int(PR * 100 * 2.55)
-    intensity = max(0, min(intensity, 100))
-    color_map[np.where(explo_area_map_cur == PR)] = [intensity, intensity, intensity]  #  RGB 值
-
-    lipped_map = cv2.flip(color_map, 0)
-    color_map__ = Image.fromarray(lipped_map)
-    color_map__ = color_map__.convert("RGB")
-
-    
-    # 显示彩色图像
-    # fn = f'Vis-explore2_{count}.png'
-    # # cv2.imwrite(fn, color_map__)
-    # color_map__.save(fn)
-
-    return explo_area_map_cur, color_map
-
-def Frontiers(full_map_pred):
-    # ------------------------------------------------------------------
-    ##### Get the frontier map and filter
-    # ------------------------------------------------------------------
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(3, 3))
-    full_w = full_map_pred.shape[1]
-    local_ex_map = np.zeros((full_w, full_w))
-    local_ob_map = np.zeros((full_w, full_w))
-
-    local_ob_map = cv2.dilate(full_map_pred[0].cpu().numpy(), kernel)
-
-    show_ex = cv2.inRange(full_map_pred[1].cpu().numpy(),0.1,1)
-    
-    kernel = np.ones((5, 5), dtype=np.uint8)
-    free_map = cv2.morphologyEx(show_ex, cv2.MORPH_CLOSE, kernel)
-
-    contours,_=cv2.findContours(free_map, cv2.RETR_TREE,cv2.CHAIN_APPROX_NONE)
-    if len(contours)>0:
-        contour = max(contours, key = cv2.contourArea)
-        cv2.drawContours(local_ex_map,contour,-1,1,1)
-
-    # clear the boundary
-    local_ex_map[0:2, 0:full_w]=0.0
-    local_ex_map[full_w-2:full_w, 0:full_w-1]=0.0
-    local_ex_map[0:full_w, 0:2]=0.0
-    local_ex_map[0:full_w, full_w-2:full_w]=0.0
-
-    target_edge = local_ex_map-local_ob_map
-    # print("local_ob_map ", self.local_ob_map[200])
-    # print("full_map ", self.full_map[0].cpu().numpy()[200])
-
-    target_edge[target_edge>0.8]=1.0
-    target_edge[target_edge!=1.0]=0.0
-
-    wall_edge = local_ex_map - target_edge
-
-    # contours, hierarchy = cv2.findContours(cv2.inRange(wall_edge,0.1,1), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    # if len(contours)>0:
-    #     dst = np.zeros(wall_edge.shape)
-    #     cv2.drawContours(dst, contours, -1, 1, 1)
-
-    # edges = cv2.Canny(cv2.inRange(wall_edge,0.1,1), 30, 90)
-    Wall_lines = cv2.HoughLinesP(cv2.inRange(wall_edge,0.1,1), 1, np.pi / 180, threshold=30, minLineLength=10, maxLineGap=10)
-
-    # original_image_color = cv2.cvtColor(cv2.inRange(wall_edge,0.1,1), cv2.COLOR_GRAY2BGR)
-    # if lines is not None:
-    #     for line in lines:
-    #         x1, y1, x2, y2 = line[0]
-    #         cv2.line(original_image_color, (x1, y1), (x2, y2), (0, 0, 255), 2)
-
-    
-    img_label, num = measure.label(target_edge, connectivity=2, return_num=True)#输出二值图像中所有的连通域
-    props = measure.regionprops(img_label)#输出连通域的属性，包括面积等
-
-    Goal_edge = np.zeros((img_label.shape[0], img_label.shape[1]))
-    Goal_point = []
-    Goal_area_list = []
-    dict_cost = {}
-    for i in range(1, len(props)):
-        if props[i].area > 4:
-            dict_cost[i] = props[i].area
-
-    if dict_cost:
-        dict_cost = sorted(dict_cost.items(), key=lambda x: x[1], reverse=True)
-
-        for i, (key, value) in enumerate(dict_cost):
-            Goal_edge[img_label == key + 1] = 1
-            Goal_point.append([int(props[key].centroid[0]), int(props[key].centroid[1])])
-            Goal_area_list.append(value)
-            if i == 3:
-                break
-        # frontiers = cv2.HoughLinesP(cv2.inRange(Goal_edge,0.1,1), 1, np.pi / 180, threshold=10, minLineLength=10, maxLineGap=10)
-
-        # original_image_color = cv2.cvtColor(cv2.inRange(Goal_edge,0.1,1), cv2.COLOR_GRAY2BGR)
-        # if frontiers is not None:
-        #     for frontier in frontiers:
-        #         x1, y1, x2, y2 = frontier[0]
-        #         cv2.line(original_image_color, (x1, y1), (x2, y2), (0, 0, 255), 2)
-
-    return Wall_lines, Goal_area_list, Goal_edge, Goal_point
-
-# 画出所有的Frontier
-def Visualize(args, episode_n, l_step, pose_pred, full_map_pred, goal_name, visited_vis, map_edge, Frontiers_dict, goal_points):
-    dump_dir = "{}/dump/{}/".format(args.dump_location,
-                                    args.exp_name)
-    ep_dir = '{}/episodes/eps_{}/'.format(
-        dump_dir, episode_n)
-    if not os.path.exists(ep_dir):
-        os.makedirs(ep_dir)
-
-    full_w = full_map_pred.shape[1]
-
-    map_pred = full_map_pred[0, :, :].cpu().numpy()
-    exp_pred = full_map_pred[1, :, :].cpu().numpy()
-
-    sem_map = full_map_pred[4:, :,:].argmax(0).cpu().numpy()
-
-    sem_map += 5
-
-    # no_cat_mask = sem_map == 20
-    no_cat_mask = sem_map == len(object_category) - 2
-    map_mask = np.rint(map_pred) == 1
-    exp_mask = np.rint(exp_pred) == 1
-    edge_mask = map_edge == 1
-
-    sem_map[no_cat_mask] = 0
-    m1 = np.logical_and(no_cat_mask, exp_mask)
-    sem_map[m1] = 2
-
-    m2 = np.logical_and(no_cat_mask, map_mask)
-    sem_map[m2] = 1
-
-    for i in range(args.num_agents):
-        sem_map[visited_vis[i] == 1] = 3+i
-    sem_map[edge_mask] = 3
-
-
-    def find_big_connect(image):
-        img_label, num = measure.label(image, return_num=True)#输出二值图像中所有的连通域
-        props = measure.regionprops(img_label)#输出连通域的属性，包括面积等
-        # print("img_label.shape: ", img_label.shape) # 480*480
-        resMatrix = np.zeros(img_label.shape)
-        tmp_area = 0
-        for i in range(0, len(props)):
-            if props[i].area > tmp_area:
-                tmp = (img_label == i + 1).astype(np.uint8)
-                resMatrix = tmp
-                tmp_area = props[i].area 
-        
-        return resMatrix
-
-    goal = np.zeros((full_w, full_w)) 
-    if 'objectnav_mp3d' in args.task_config:
-        cn = goal_name
-    elif 'objectnav_hm3d' in args.task_config:
-        cn = coco_categories[goal_name] + 4
-    if full_map_pred[cn, :, :].sum() != 0.:
-        cat_semantic_map = full_map_pred[cn, :, :].cpu().numpy()
-        cat_semantic_scores = cat_semantic_map
-        cat_semantic_scores[cat_semantic_scores > 0] = 1.
-        goal = find_big_connect(cat_semantic_scores)
-
-        selem = skimage.morphology.disk(4)
-        goal_mat = 1 - skimage.morphology.binary_dilation(
-            goal, selem) != True
-
-        goal_mask = goal_mat == 1
-        sem_map[goal_mask] = 4
-    elif len(goal_points) == args.num_agents and goal_points[i][0] != 9999:
-        for i in range(args.num_agents):
-            goal = np.zeros((full_w, full_w)) 
-            goal[goal_points[i][0], goal_points[i][1]] = 1
-            selem = skimage.morphology.disk(4)
-            goal_mat = 1 - skimage.morphology.binary_dilation(
-                goal, selem) != True
-            goal_mask = goal_mat == 1
-
-            sem_map[goal_mask] = 3 + i
-    
-
-    color_pal = [int(x * 255.) for x in color_palette]
-    sem_map_vis = Image.new("P", (sem_map.shape[1],
-                                    sem_map.shape[0]))
-    sem_map_vis.putpalette(color_pal)
-    sem_map_vis.putdata(sem_map.flatten().astype(np.uint8))
-    sem_map_vis = sem_map_vis.convert("RGB")
-    sem_map_vis = np.flipud(sem_map_vis)
-
-    sem_map_vis = sem_map_vis[:, :, [2, 1, 0]]
-    sem_map_vis = cv2.resize(sem_map_vis, (480, 480),
-                                interpolation=cv2.INTER_NEAREST)
-
-    color = []
-    for i in range(args.num_agents):
-        color.append((int(color_palette[11+3*i] * 255),
-                    int(color_palette[10+3*i] * 255),
-                    int(color_palette[9+3*i] * 255)))
-
-    # vis_image = vu.init_multi_vis_image(category_to_id[goal_name], color)
-    if 'objectnav_mp3d' in args.task_config:
-        vis_image = vu.init_multi_vis_image(object_category[goal_name], color)
-    elif 'objectnav_hm3d' in args.task_config:
-        vis_image = vu.init_multi_vis_image(object_category[coco_categories_hm3d2mp3d[goal_name]], color)
-
-    vis_image[50:530, 15:495] = sem_map_vis
-
-    color_black = (0,0,0)
-    pattern = r'<centroid: (.*?), (.*?), number: (.*?)>'
-    alpha = [chr(ord("A") + i) for i in range(26)]
-    alpha0 = 0
-    
-    def d240(x):
-        if x < 240:
-            x = x + 2*(240-x)
-        elif x >= 240:
-            x = x - 2*(x-240)
-        return x
-    
-    if Frontiers_dict:
-        for keys, value in Frontiers_dict.items():
-            match = re.match(pattern, value)
-            if match:
-                centroid_x = int(match.group(1)[1:])
-                centroid_y = int(match.group(2)[:-1])
-                number = float(match.group(3))
-                # print(f"Centroid: ({centroid_x}, {centroid_y})")
-                # print(f"Number: {number}")
-                
-                cv2.circle(sem_map_vis, (centroid_y, d240(centroid_x)), 5, color_black, -1)
-                label = f"{alpha[alpha0]}"
-                alpha0 += 1
-                cv2.putText(sem_map_vis, label, (centroid_y + 5, d240(centroid_x) + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_black, 1)
-    for i in range(args.num_agents):
-        agent_arrow = vu.get_contour_points(pose_pred[i], origin=(15, 50), size=10)
-
-        cv2.drawContours(vis_image, [agent_arrow], 0, color[i], -1)
-    if args.visualize:
-        # Displaying the image
-        cv2.imshow("episode_n {}".format(episode_n), vis_image)
-        cv2.waitKey(1)
-
-    if args.print_images:
-        fn = '{}/episodes/eps_{}/Step-{}.png'.format(
-            dump_dir, episode_n,
-            l_step)
-        # print(fn)
-        cv2.imwrite(fn, vis_image)   
-
-def Decision_Generation_Vis(args, agents_seg_list, agent_j, episode_n, l_step, pose_pred, full_map_pred, goal_name,
-                             visited_vis, map_edge, history_nodes, Frontiers_dict, goal_points, pre_goal_point):
-    full_w = full_map_pred.shape[1]
-
-    map_pred = full_map_pred[0, :, :].cpu().numpy()
-    exp_pred = full_map_pred[1, :, :].cpu().numpy()
-
-    sem_map = full_map_pred[4:, :,:].argmax(0).cpu().numpy()
-
-    sem_map += 5
-
-    # no_cat_mask = sem_map == 20
-    no_cat_mask = sem_map == len(object_category) - 2
-    map_mask = np.rint(map_pred) == 1
-    exp_mask = np.rint(exp_pred) == 1
-    edge_mask = map_edge == 1
-
-    sem_map[no_cat_mask] = 0
-    m1 = np.logical_and(no_cat_mask, exp_mask)
-    sem_map[m1] = 2
-
-    m2 = np.logical_and(no_cat_mask, map_mask)
-    sem_map[m2] = 1
-
-    for i in range(args.num_agents):
-        sem_map[visited_vis[i] == 1] = 3+i
-    sem_map[edge_mask] = 3
-
-
-    def find_big_connect(image):
-        img_label, num = measure.label(image, return_num=True)#输出二值图像中所有的连通域
-        props = measure.regionprops(img_label)#输出连通域的属性，包括面积等
-        # print("img_label.shape: ", img_label.shape) # 480*480
-        resMatrix = np.zeros(img_label.shape)
-        tmp_area = 0
-        for i in range(0, len(props)):
-            if props[i].area > tmp_area:
-                tmp = (img_label == i + 1).astype(np.uint8)
-                resMatrix = tmp
-                tmp_area = props[i].area 
-        
-        return resMatrix
-
-    goal = np.zeros((full_w, full_w)) 
-    if 'objectnav_mp3d' in args.task_config:
-        cn = goal_name
-    elif 'objectnav_hm3d' in args.task_config:
-        cn = coco_categories[goal_name] + 4
-    if full_map_pred[cn, :, :].sum() != 0.:
-        cat_semantic_map = full_map_pred[cn, :, :].cpu().numpy()
-        cat_semantic_scores = cat_semantic_map
-        cat_semantic_scores[cat_semantic_scores > 0] = 1.
-        goal = find_big_connect(cat_semantic_scores)
-
-        selem = skimage.morphology.disk(4)
-        goal_mat = 1 - skimage.morphology.binary_dilation(
-            goal, selem) != True
-
-        goal_mask = goal_mat == 1
-        sem_map[goal_mask] = 4
-    elif len(goal_points) == args.num_agents and goal_points[i][0] != 9999:
-        for i in range(args.num_agents):
-            goal = np.zeros((full_w, full_w)) 
-            goal[goal_points[i][0], goal_points[i][1]] = 1
-            selem = skimage.morphology.disk(4)
-            goal_mat = 1 - skimage.morphology.binary_dilation(
-                goal, selem) != True
-            goal_mask = goal_mat == 1
-
-            sem_map[goal_mask] = 3 + i
-    pattern = r'<centroid: (.*?), (.*?), number: (.*?)>'
-    if Frontiers_dict:
-        for keys, value in Frontiers_dict.items():
-            match = re.match(pattern, value)
-            if match:
-                centroid_x = int(match.group(1)[1:])
-                centroid_y = int(match.group(2)[:-1])
-                number = float(match.group(3))
-            fgoal = np.zeros((full_w, full_w)) 
-            fgoal[centroid_x, centroid_y] = 1
-            selem = skimage.morphology.disk(4)
-            goal_mat = 1 - skimage.morphology.binary_dilation(
-                fgoal, selem) != True
-            goal_mask = goal_mat == 1
-            sem_map[goal_mask] = 2
-
-    
-    color = []
-    for i in range(args.num_agents):
-        color.append((int(color_palette[11+3*i] * 255),
-                    int(color_palette[10+3*i] * 255),
-                    int(color_palette[9+3*i] * 255)))
-    
-    color_pal = [int(x * 255.) for x in color_palette]
-    sem_map_vis = Image.new("P", (sem_map.shape[1],
-                                    sem_map.shape[0]))
-    sem_map_vis.putpalette(color_pal)
-    sem_map_vis.putdata(sem_map.flatten().astype(np.uint8))
-    sem_map_vis = sem_map_vis.convert("RGB")
-    sem_map_vis = np.flipud(sem_map_vis)
-
-    sem_map_vis = sem_map_vis[:, :, [2, 1, 0]]
-    sem_map_vis = cv2.resize(sem_map_vis, (480, 480),
-                                interpolation=cv2.INTER_NEAREST)
-
-    color_black = (0,0,0)
-    color_green = (0,255,0)
-    color_red = (0,0,255)
-    color_blue = (255,0,0)
-    pattern = r'<centroid: (.*?), (.*?), number: (.*?)>'
-    alpha = [chr(ord("A") + i) for i in range(26)]
-    alpha0 = 0
-    
-    def d240(x):
-        if x < 240:
-            x = x + 2*(240-x)
-        elif x >= 240:
-            x = x - 2*(x-240)
-        return x
-
-    
-
-
-    # for i in range(args.num_agents):
-    #     agent_arrow = vu.get_contour_points(pose_pred[i], origin=(0, 0), size=10)
-
-    #     cv2.drawContours(sem_map_vis, [agent_arrow], 0, color[i], -1)
-    # agent_arrow = vu.get_contour_points(pose_pred[agent_j], origin=(0, 0), size=10)
-
-    # cv2.drawContours(sem_map_vis, [agent_arrow], 0, color[agent_j], -1)
-    if Frontiers_dict:
-        for keys, value in Frontiers_dict.items():
-            match = re.match(pattern, value)
-            if match:
-                centroid_x = int(match.group(1)[1:])
-                centroid_y = int(match.group(2)[:-1])
-                number = float(match.group(3))
-                # print(f"Centroid: ({centroid_x}, {centroid_y})")
-                # print(f"Number: {number}")
-                
-                cv2.circle(sem_map_vis, (centroid_y, d240(centroid_x)), 5, color_black, -1)
-                label = f"{alpha[alpha0]}"
-                alpha0 += 1
-                cv2.putText(sem_map_vis, label, (centroid_y + 5, d240(centroid_x) + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_black, 1)
-
-    sem_map_vis2 = sem_map_vis.copy()
-    beta = [chr(ord("a") + i) for i in range(26)]
-    alpha0 = 0
-    if len(history_nodes) > 0:
-        for hs in history_nodes[:26]:
-            centroid_x = int(hs[0])
-            centroid_y = int(hs[1])
-            cv2.circle(sem_map_vis, (centroid_y, d240(centroid_x)), 5, color_green, -1)
-            label = f"{beta[alpha0]}"
-            alpha0 += 1
-            cv2.putText(sem_map_vis, label, (centroid_y + 5, d240(centroid_x) + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_green, 1)
-        for hs in history_nodes[26:]:
-            centroid_x = int(hs[0])
-            centroid_y = int(hs[1])
-            cv2.circle(sem_map_vis, (centroid_y, d240(centroid_x)), 5, color_green, -1)
-            label = f"{alpha[alpha0]}"
-            alpha0 += 1
-            cv2.putText(sem_map_vis, label, (centroid_y + 5, d240(centroid_x) + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_green, 1)
-    # 遍历字典并绘制多边形
-    for key, value in agents_seg_list.items():
-        # 将每个 value 转换成适合 cv2.polylines 使用的格式（一个 numpy 数组）
-        for array in value:
-            pts = array.reshape((-1, 1, 2))
-            if agent_j == 0:
-                for i in pts:
-                    for j in i:
-                        j[1] = d240(j[1])
-            
-            # 绘制多边形
-            # cv2.polylines(sem_map_vis, [pts], isClosed=True, color=color_bule, thickness=2)
-            
-            # 标注key值，文本位置选在多边形的第一个坐标处
-            text_position = (pts[0][0][0], pts[0][0][1])
-            # moments = cv2.moments(pts)
-            # cX = int(moments["m10"] / moments["m00"])
-            # cY = int(moments["m01"] / moments["m00"])
-            cv2.putText(sem_map_vis, key, text_position, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-            cv2.putText(sem_map_vis2, key, text_position, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-    
-
-    # 画出箭头
-    # cv2.circle(sem_map_vis, (int(pose_pred[agent_j][0]), int(pose_pred[agent_j][1])), 8, color_red, -1)
-    # cv2.circle(sem_map_vis2, (int(pose_pred[agent_j][0]), int(pose_pred[agent_j][1])), 8, color_red, -1)
-    
-    agent_arrow = vu.get_contour_points(pose_pred[agent_j], origin=(0, 0), size=15)
-    cv2.drawContours(sem_map_vis, [agent_arrow], 0, color_red, -1)
-    cv2.drawContours(sem_map_vis2, [agent_arrow], 0, color_red, -1)
-    if pre_goal_point:
-        cv2.circle(sem_map_vis, (int(pre_goal_point[1]), int(d240(pre_goal_point[0]))), 8, color_blue, -1)
-        cv2.circle(sem_map_vis2, (int(pre_goal_point[1]), int(d240(pre_goal_point[0]))), 8, color_blue, -1)
-
-    
-    
-    
-    ### TEST
-    dump_dir = "{}/dump/{}/".format(args.dump_location,
-                                    args.exp_name)
-    vis_ep_dir = '{}/episodes/eps_{}/Agent0_vis'.format(
-                dump_dir, episode_n)
-    if not os.path.exists(vis_ep_dir):
-        os.makedirs(vis_ep_dir)
-    
-    fn = '{}/episodes/eps_{}/Agent0_vis/VisStep-{}.png'.format(
-                        dump_dir, episode_n,
-                        l_step)
-    fn2 = '{}/episodes/eps_{}/Agent0_vis/VisStep2-{}.png'.format(
-                        dump_dir, episode_n,
-                        l_step)
-    cv2.imwrite(fn, sem_map_vis)  
-    cv2.imwrite(fn2, sem_map_vis2) 
-
-    return sem_map_vis, sem_map_vis2
-
-
-
-def Visualize0(args, episode_n, l_step, pose_pred, full_map_pred, goal_name, visited_vis, map_edge, goal_points):
-    dump_dir = "{}/dump/{}/".format(args.dump_location,
-                                    args.exp_name)
-    ep_dir = '{}/episodes/eps_{}/'.format(
-        dump_dir, l_step)
-    if not os.path.exists(ep_dir):
-        os.makedirs(ep_dir)
-
-    full_w = full_map_pred.shape[1]
-
-    map_pred = full_map_pred[0, :, :].cpu().numpy()
-    exp_pred = full_map_pred[1, :, :].cpu().numpy()
-
-    sem_map = full_map_pred[4:, :,:].argmax(0).cpu().numpy()
-
-    sem_map += 5
-
-    no_cat_mask = sem_map == 20
-    map_mask = np.rint(map_pred) == 1
-    exp_mask = np.rint(exp_pred) == 1
-    edge_mask = map_edge == 1
-
-    sem_map[no_cat_mask] = 0
-    m1 = np.logical_and(no_cat_mask, exp_mask)
-    sem_map[m1] = 2
-
-    m2 = np.logical_and(no_cat_mask, map_mask)
-    sem_map[m2] = 1
-
-    for i in range(args.num_agents):
-        sem_map[visited_vis[i] == 1] = 3+i
-    sem_map[edge_mask] = 3
-
-
-    def find_big_connect(image):
-        img_label, num = measure.label(image, return_num=True)#输出二值图像中所有的连通域
-        props = measure.regionprops(img_label)#输出连通域的属性，包括面积等
-        # print("img_label.shape: ", img_label.shape) # 480*480
-        resMatrix = np.zeros(img_label.shape)
-        tmp_area = 0
-        for i in range(0, len(props)):
-            if props[i].area > tmp_area:
-                tmp = (img_label == i + 1).astype(np.uint8)
-                resMatrix = tmp
-                tmp_area = props[i].area 
-        
-        return resMatrix
-
-    goal = np.zeros((full_w, full_w)) 
-    if 'objectnav_mp3d' in args.task_config:
-        cn = goal_name
-    elif 'objectnav_hm3d' in args.task_config:
-        cn = coco_categories[goal_name] + 4
-    if full_map_pred[cn, :, :].sum() != 0.:
-        cat_semantic_map = full_map_pred[cn, :, :].cpu().numpy()
-        cat_semantic_scores = cat_semantic_map
-        cat_semantic_scores[cat_semantic_scores > 0] = 1.
-        goal = find_big_connect(cat_semantic_scores)
-
-        selem = skimage.morphology.disk(4)
-        goal_mat = 1 - skimage.morphology.binary_dilation(
-            goal, selem) != True
-
-        goal_mask = goal_mat == 1
-        sem_map[goal_mask] = 4
-    elif len(goal_points) == args.num_agents:
-        for i in range(args.num_agents):
-            goal = np.zeros((full_w, full_w)) 
-            goal[goal_points[i][0], goal_points[i][1]] = 1
-            selem = skimage.morphology.disk(4)
-            goal_mat = 1 - skimage.morphology.binary_dilation(
-                goal, selem) != True
-            goal_mask = goal_mat == 1
-
-            sem_map[goal_mask] = 3 + i
-
-
-    color_pal = [int(x * 255.) for x in color_palette]
-    sem_map_vis = Image.new("P", (sem_map.shape[1],
-                                    sem_map.shape[0]))
-    sem_map_vis.putpalette(color_pal)
-    sem_map_vis.putdata(sem_map.flatten().astype(np.uint8))
-    sem_map_vis = sem_map_vis.convert("RGB")
-    sem_map_vis = np.flipud(sem_map_vis)
-
-    sem_map_vis = sem_map_vis[:, :, [2, 1, 0]]
-    sem_map_vis = cv2.resize(sem_map_vis, (480, 480),
-                                interpolation=cv2.INTER_NEAREST)
-
-    color = []
-    for i in range(args.num_agents):
-        color.append((int(color_palette[11+3*i] * 255),
-                    int(color_palette[10+3*i] * 255),
-                    int(color_palette[9+3*i] * 255)))
-
-    vis_image = vu.init_multi_vis_image(category_to_id[goal_name], color)
-
-    vis_image[50:530, 15:495] = sem_map_vis
-
-    for i in range(args.num_agents):
-        agent_arrow = vu.get_contour_points(pose_pred[i], origin=(15, 50), size=10)
-
-        cv2.drawContours(vis_image, [agent_arrow], 0, color[i], -1)
-
-    if args.visualize:
-        # Displaying the image
-        cv2.imshow("episode_n {}".format(episode_n), vis_image)
-        cv2.waitKey(1)
-
-    if args.print_images:
-        fn = '{}/episodes/eps_{}/Vis-{}.png'.format(
-            dump_dir, episode_n,
-            l_step)
-        cv2.imwrite(fn, vis_image)
-
-def calculate_distance(coord1, coord2):
-    return math.sqrt((coord1[0] - coord2[0]) ** 2 + (coord1[1] - coord2[1]) ** 2)
-
-def main():
-    args = get_args()
-
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-
-    device = torch.device("cuda:0" if args.cuda else "cpu")
-
-    # logging.info(f"stride:{stride}")
-    # logging.info(f"names:{names}")
-    # logging.info(f"pt:{pt}")
-
-
-    HabitatSimActions.extend_action_space("TURN_LEFT_S")
-    HabitatSimActions.extend_action_space("TURN_RIGHT_S")
-
-    config_env = habitat.get_config(config_paths=["envs/habitat/configs/"
-                                         + args.task_config])
-    config_env.defrost()
-
-    config_env.TASK.POSSIBLE_ACTIONS = config_env.TASK.POSSIBLE_ACTIONS + [
-        "TURN_LEFT_S",
-        "TURN_RIGHT_S",
-    ]
-    config_env.TASK.ACTIONS.TURN_LEFT_S = habitat.config.Config()
-    config_env.TASK.ACTIONS.TURN_LEFT_S.TYPE = "TurnLeftAction_S"
-    config_env.TASK.ACTIONS.TURN_RIGHT_S = habitat.config.Config()
-    config_env.TASK.ACTIONS.TURN_RIGHT_S.TYPE = "TurnRightAction_S"
-    config_env.SIMULATOR.ACTION_SPACE_CONFIG = "PreciseTurn"
-    config_env.freeze()
-
-    # Load VLM
-    # vlm = VLM(args.vlm_model_id, args.hf_token, device)
-    base_url = args.base_url 
-    cogvlm2 = CogVLM2(base_url) 
-    # Load Yolo
-    # yolo = Detect(imgsz=(args.env_frame_height, args.env_frame_width), device=device)
-    if args.yolo == 'yolov9':
-        # yolo = Detect(imgsz=(args.env_frame_height, args.env_frame_width), device=device)
-        pass
-    else:
-        yolo = YOLOv10.from_pretrained(args.yolo_weights)
-    # print(config_env)
-    print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
-
-    # exit(0)
-
-
-    # TSDF需要init_pts（初始三维坐标）、pathfinder（habitat_sim）
-    # sim_cfg = config_env
-    # simulator = habitat_sim.Simulator(sim_cfg)
-    # print(simulator.pathfinder)
-    
-    env = Multi_Agent_Env(config_env=config_env)
-
-    num_episodes = env.number_of_episodes
-
-    assert num_episodes > 0, "num_episodes should be greater than 0"
-
-    num_agents = config_env.SIMULATOR.NUM_AGENTS
-
-    agent = []
-    for i in range(num_agents):
-        agent.append(LLM_Agent(args, i, device))
-
-    # ------------------------------------------------------------------
-    ##### Setup Logging
-    # ------------------------------------------------------------------
-    log_dir = "{}/logs/{}/".format(args.dump_location, args.exp_name)
-    dump_dir = "{}/dump/{}/".format(args.dump_location, args.exp_name)
-
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
-    if not os.path.exists(dump_dir):
-        os.makedirs(dump_dir)
-
-    logging.basicConfig(
-        filename=log_dir + 'output.log',
-        level=logging.INFO)
-    print("Dumping at {}".format(log_dir))
-    # print(args)
-    # logging.info(args)
-    # ------------------------------------------------------------------
-
-    # print("num_episodes:",num_episodes)# 1000
-
-    agg_metrics: Dict = defaultdict(float)
-    agg_metrics['success_rate'] = 0
-
-    count_episodes = 0
-    count_step = 0
-    goal_points = []
-    
-    log_start = time.time()
-    last_decision = []
-    total_usage = []
-
-    history_nodes = []
-    history_score = []
-    history_count = []
-    history_states = []
-
-    cur_goal_points = []
-    pre_goal_points = []
-
-    # random
-    log_start = time.time()
-    last_decision = []
-    total_usage = []
-
-    pre_g_points = []
-
-    target_point = []
-
-    
-
-    # logging.info(f"num agents: {num_agents}")
-
-    while count_episodes < num_episodes:
-        observations = env.reset()
-        for i in range(num_agents):
-            agent[i].reset()
-        
-        history_nodes.clear()
-        history_score.clear()
-        history_count.clear()
-        history_states.clear()
-        pre_g_points.clear()
-        target_point.clear()
-
-        goal_points.clear()
-        for j in range(num_agents):
-            goal_points.append([0, 0])
-
-        while not env.episode_over:
-            
-            all_rgb = [] # 用于保存每个智能体的
-            # all_objs = [] # 记录每个时间步每个智能体的目标检测信息
-            # all_VLM_Pred = [] # 记录每个时间步中每个智能体的VLM预测结果
-            # all_VLM_PR = [] # 记录每个时间步中每个智能体的PR分数
-            Local_Policy = 0 # 何时调用local policy
-            start = time.time()
-            count_rotating = 0
-            action = []
-            
-            for j in range(num_agents):
-                action.append(0)
-                
-######################################################################################################################
-            #### 这个是画图测试用的，现在是没有决策策略的(多智能体) （已删除）
-        
-
-######################################################################################################################
-            # for ags in range(360 // args.turn_angle): # 旋转 删除旋转
-                
-            full_map = []
-            full_map1 = []
-            visited_vis = []
-            pose_pred = []
-            agent_objs = {} # 记录单个时间步内每个智能体的目标检测信息
-            agents_VLM_Rel = {} # 记录单个时间步内（每个角度）每个智能体的VLM预测分数
-            agents_VLM_Pred = {} # 记录单个时间步内（每个角度）每个智能体的VLM预测结果
-            agents_VLM_PR = {} # 记录单个时间步内（每个角度）每个智能体的VLM PR分数
-
-            agent_FrontierList = [] # 记录智能体Frontier
-            agent_TargetEdgeMap = []
-            agent_TargetPointMap = []
-            agent_MapPred = []
-
-            for i in range(num_agents):
-                agent[i].mapping(observations[i])
-                local_map1, _ = torch.max(agent[i].local_map.unsqueeze(0), 0)
-                full_map.append(agent[i].local_map)
-                visited_vis.append(agent[i].visited_vis)
-                start_x, start_y, start_o, gx1, gx2, gy1, gy2 = agent[i].planner_pose_inputs
-
-                gx1, gx2, gy1, gy2 = int(gx1), int(gx2), int(gy1), int(gy2)
-                pos = (
-                    (start_x * 100. / args.map_resolution - gy1)
-                    * 480 / agent[i].visited_vis.shape[0],
-                    (agent[i].visited_vis.shape[1] - start_y * 100. / args.map_resolution + gx1)
-                    * 480 / agent[i].visited_vis.shape[1],
-                    np.deg2rad(-start_o)
-                )
-                pose_pred.append(pos)
-
-                    
-            full_map2 = torch.cat([fm.unsqueeze(0) for fm in full_map], dim=0)
-            # full_map2 = full_map[0].unsqueeze(0)
-            # logging.info(f"full_map2: {full_map2.shape}") #[x,20,480,480]
-
-            full_map_pred, _ = torch.max(full_map2, 0)
-            Wall_list, full_Frontier_list, full_target_edge_map, full_target_point_map = Frontiers(full_map_pred)
-
-
-            if agent[0].l_step % args.num_local_steps == args.num_local_steps - 1 or agent[0].l_step == 0:
-                for j in range(num_agents):
-                    # goal_points[j] = [9999, 9999]
-                    # agent[j].EXIT = False
-                    agent[j].Perception_PR = 0
-                    # agent[j].Max_Perception_Angle = 360
-                    # agent[j].count_rerotation = 0
-                
-                agents_seg_list = Objects_Extract(args, full_map_pred, args.use_sam)
-
-                pre_goal_points.clear()
-                if len(cur_goal_points) > 0:
-                    pre_goal_points = cur_goal_points.copy()
-                    cur_goal_points.clear()
-                    
-                if len(full_target_point_map) > 0:
-                    full_Frontiers_dict = {}
-                    for j in range(len(full_target_point_map)):
-                        full_Frontiers_dict['frontier_' + str(j)] = f"<centroid: {full_target_point_map[j][0], full_target_point_map[j][1]}, number: {full_Frontier_list[j]}>"
-                    logging.info(f'=====> Frontier: {full_Frontiers_dict}')
-
-                    if len(history_nodes) > 0:
-                        logging.info(f'=====> history_nodes: {history_nodes}')
-                        logging.info(f'=====> history_score: {history_score}')
-
-                    # full_sem_map = Decision_Generation_Vis(args, agent[0].episode_n, agent[0].l_step, pose_pred, full_map_pred, 
-                    #                 agent[0].goal_id, visited_vis, full_target_edge_map, history_nodes, full_Frontiers_dict, goal_points)
-                        
-                    # VLM_Decision_Prompt_Meta = form_prompt_for_DecisionVLM_MetaPreprocess()
-                    # _, Decision_Pred_Meta = cogvlm2.simple_image_chat(User_Prompt=VLM_Decision_Prompt_Meta, 
-                    #                                                                 return_string_probabilities=None, img=full_sem_map)
-                    # Decision_Pred_Meta = '''
-                    # Scenario exploration analysis module: Yes
-                    # Scene object detection module: Yes
-                    # Scenario exploration analysis module: Yes
-                    # '''
-                    ##### VLM Process :>
-
-                    # Decisions = []
-                    # full_rgb1 = []
-                    
-                    for j in range(num_agents):
-                        agent[j].is_Frontier = True
-                        rgb = observations[j]['rgb'].astype(np.uint8)
-                        
-                        # full_rgb1.append(full_rgb)
-                        all_rgb.append(rgb)
-                        goal_name = agent[j].goal_name
-                        if args.yolo == 'yolov9':
-                            agent_objs[f"agent_{j}"] = yolo.run(rgb) # 记录一个时间步内每个智能体的目标检测信息
-                        else:
-                            yolo_output = yolo(source=rgb,conf=0.2)
-                            yolo_mapping = [yolo_output[0].names[int(c)] for c in yolo_output[0].boxes.cls]
-                            agent_objs[f"agent_{j}"] = {k: v for k, v in zip(yolo_mapping, yolo_output[0].boxes.conf)}
-                        # logging.info(agent_objs)
-                        
-                        # agents_seg_list = Objects_Extract(local_map1, args.use_sam)
-                        single_map = [full_map[j]]
-
-                        full_map1.append(torch.cat([fm.unsqueeze(0) for fm in single_map], dim=0))
-                        full_map_pred1, _ = torch.max(full_map1[j], 0)
-                        Wall_list, Frontier_list, target_edge_map, target_point_map = Frontiers(full_map_pred1)
-                        agent_FrontierList.append(Frontier_list)
-                        agent_TargetEdgeMap.append(target_edge_map)
-                        agent_TargetPointMap.append(target_point_map)
-                        agent_MapPred.append(full_map_pred1)
-
-                        
-
-                        start_x, start_y, start_o, gx1, gx2, gy1, gy2 = agent[j].planner_pose_inputs
-                        r, c = start_y, start_x
-                        start = [int(r * 100.0 / args.map_resolution - gx1),
-                                int(c * 100.0 / args.map_resolution - gy1)]
-                        start = pu.threshold_poses(start, agent[j].local_map[0, :, :].cpu().numpy().shape)
-                        
-                        if len(pre_goal_points) > 0:
-                            # sem_map, sem_map_frontier = Decision_Generation_Vis(args, agents_seg_list, j, agent[0].episode_n, agent[0].l_step, pose_pred, agent_MapPred[j], 
-                            #                 agent[j].goal_id, visited_vis[j], agent_TargetEdgeMap[j], history_nodes, full_Frontiers_dict, goal_points=[], pre_goal_point=pre_goal_points[j])
-                            sem_map, sem_map_frontier = Decision_Generation_Vis(args, agents_seg_list, j, agent[0].episode_n, agent[0].l_step, pose_pred, full_map_pred, 
-                                    agent[0].goal_id, visited_vis, full_target_edge_map, history_nodes, full_Frontiers_dict, goal_points=[], pre_goal_point=pre_goal_points[j])
-                        else:
-                            # sem_map, sem_map_frontier = Decision_Generation_Vis(args, agents_seg_list, j, agent[0].episode_n, agent[0].l_step, pose_pred, agent_MapPred[j], 
-                            #                 agent[j].goal_id, visited_vis[j], agent_TargetEdgeMap[j], history_nodes, full_Frontiers_dict, goal_points=[], pre_goal_point=None)
-                            sem_map, sem_map_frontier = Decision_Generation_Vis(args, agents_seg_list, j, agent[0].episode_n, agent[0].l_step, pose_pred, full_map_pred, 
-                                    agent[0].goal_id, visited_vis, full_target_edge_map, history_nodes, full_Frontiers_dict, goal_points=[], pre_goal_point=None)
-                        # full_rgb = np.hstack((rgb, sem_map))
-
-                        
-
-                        #### 感知VLM
-                        Caption_Prompt, VLM_Perception_Prompt = form_prompt_for_PerceptionVLM(goal_name, agent_objs[f'agent_{j}'], args.yolo)
-                        _, Scene_Information = cogvlm2.simple_image_chat(User_Prompt=Caption_Prompt, 
-                                                                        return_string_probabilities=None, img=rgb)
-                        Perception_Rel, Perception_Pred = cogvlm2.COT2(User_Prompt1=Caption_Prompt, 
-                                                                       User_Prompt2=VLM_Perception_Prompt,
-                                                                       cot_pred1=Scene_Information,
-                                                                       return_string_probabilities="[Yes, No]", img=rgb)
-                        Perception_Rel = np.array(Perception_Rel)
-                        Perception_PR = Perception_weight_decision(Perception_Rel, Perception_Pred)
-                        logging.info(f"Agent_{j}--VLM_PerceptionPR: {Perception_PR}")
-                        # agents_VLM_Rel[f"Agent_{i}--VLM_PerceptionRel"] = Perception_Rel
-                        # agents_VLM_Pred[f"Agent_{i}--VLM_PerceptionPred"] = Perception_Pred
-                        # agents_VLM_PR[f"Agent_{i}--VLM_PerceptionPR"] = Perception_PR
-
-                        
-
-                        is_exist_oldhistory = False
-                        if len(history_nodes) > 0:
-                            closest_index = -1
-                            min_distance = float('inf')
-                            new_x, new_y = start
-                            for i, (x, y) in enumerate(history_nodes):
-                                distance = math.sqrt((x - new_x) * (x - new_x) + (y - new_y) * (y - new_y))
-                                if distance < 25 and distance < min_distance:
-                                    min_distance = distance
-                                    closest_index = i
-                                    is_exist_oldhistory = True
-
-                            if  is_exist_oldhistory == False:
-                                history_nodes.append(start)
-                                history_count.append(1)
-                                history_state = np.zeros(360)
-                            else:
-                                history_count[closest_index] = history_count[closest_index] + 1
-
-                            
-                        else:
-                            history_nodes.append(start)
-                            history_count.append(1)
-                            history_state = np.zeros(360)
-
-                        
-                        cur_goal_points.append(start)
-
-                        if len(agent_TargetPointMap[j]) > 0:
-                            
-                            # Frontiers_dict = {}
-                            # for k in range(len(agent_TargetPointMap[j])):
-                            #     Frontiers_dict['frontier_' + str(k)] = f"<centroid: {agent_TargetPointMap[j][k][0], agent_TargetPointMap[j][k][1]}, number: {agent_FrontierList[j][k]}>"
-                            # Agent States
-                            
-                            logging.info(f'=====> Agent_{j} state: Step: {agent[j].l_step}; Angle: {start_o}')
-
-                            ### f/n 判断VLM
-                            if len(history_nodes) > 0:
-                                if len(pre_goal_points) > 0:
-                                    FN_Prompt = form_prompt_for_FN(goal_name, agents_seg_list, Perception_PR, pre_goal_points[j], full_Frontiers_dict, start, history_nodes)
-                                else:
-                                    FN_Prompt = form_prompt_for_FN(goal_name, agents_seg_list, Perception_PR, pre_goal_points, full_Frontiers_dict, start, history_nodes)
-                                # logging.info(FN_Prompt)
-                                
-                                # 舍弃思维链1
-                                # FN_Rel, FN_Decision = cogvlm2.COT2(User_Prompt1=VLM_Perception_Prompt, 
-                                #                                     User_Prompt2=FN_Prompt,
-                                #                                     cot_pred1=Perception_Pred,
-                                #                                     return_string_probabilities="[Yes, No]", img=full_rgb)
-                                # logging.info(FN_Decision)
-                                FN_Rel, FN_Decision = cogvlm2.simple_image_chat(User_Prompt=FN_Prompt, 
-                                                                                        return_string_probabilities="[Yes, No]", img=sem_map)
-
-                                FN_PR = Perception_weight_decision(FN_Rel, FN_Decision)
-                                logging.info(f"Agent_{j}--FN_PR: {FN_PR}")
-                                if FN_PR == 'Neither':
-                                    FN_PR = FN_Rel
-
-                                
-                                
-                                angle_score = Perception_PR[0] * 2 + FN_PR[0]
-                                agent[j].angle_score = angle_score
-                                c_angle = int(start_o % 360)
-
-                                if is_exist_oldhistory == False:
-                                    if c_angle >= 39 and c_angle < 321:
-                                        history_state[c_angle-39:c_angle+39] = angle_score
-                                    elif c_angle < 39:
-                                        history_state[:c_angle+39] = angle_score
-                                        history_state[360-c_angle-39:] = angle_score
-
-                                    elif c_angle >= 321:
-                                        history_state[c_angle-39:] = angle_score
-                                        history_state[:c_angle+39-360] = angle_score
-                                    h_score = history_state.sum()
-                                    history_states.append(history_state)
-                                    history_score.append(h_score)
-                                else:
-                                    if c_angle >= 39 and c_angle < 321:
-                                        history_states[closest_index][c_angle-39:c_angle+39] = angle_score
-                                    elif c_angle < 39:
-                                        history_states[closest_index][:c_angle] = angle_score
-                                        history_states[closest_index][360-c_angle:] = angle_score
-                                    elif c_angle >= 321:
-                                        history_states[closest_index][c_angle:] = angle_score
-                                        history_states[closest_index][:360-c_angle] = angle_score
-                                    h_score = history_states[closest_index].sum() / history_count[closest_index]
-                                    history_score[closest_index] = h_score
-
-
-                                    
-
-                            # Module_Prompt = form_prompt_for_Module_Decision(goal_name, Decision_Pred_Meta, agent_objs[f"agent_{j}"])
-                            # FN = True
-                            ### 决策VLM-
-
-                            logging.info(f'=====> history_nodes: {history_nodes}')
-                            logging.info(f'=====> history_score: {history_score}')
-                            # Scores = []
-                            if j == 0:
-                                history_nodes_copy = history_nodes.copy()
-                                history_score_copy = history_score.copy()
-                                full_Frontiers_dict_copy = full_Frontiers_dict.copy()
-                            else:
-                                missing_key_F = []
-                                for element in full_Frontiers_dict.keys():
-                                    if element not in full_Frontiers_dict_copy.keys():
-                                        missing_key_F.append(element)
-                                # for element in history_nodes:
-                                #     if element not in history_nodes_copy:
-                                #         missing_index_H.append(element.index(element))
-                            if FN_PR[0] >= 0.3 or agent[j].l_step <= 125:
-                                
-                                if len(pre_goal_points) > 0:
-                                    Meta_Prompt = form_prompt_for_DecisionVLM_Frontier(Scene_Information, agents_seg_list, pre_goal_points[j], goal_name, start, full_Frontiers_dict_copy)
-                                else:
-                                    Meta_Prompt = form_prompt_for_DecisionVLM_Frontier(Scene_Information, agents_seg_list, pre_goal_points, goal_name, start, full_Frontiers_dict_copy)
-                                
-                                Meta_Score, Meta_Choice = cogvlm2.simple_image_chat(User_Prompt=Meta_Prompt,
-                                                            return_string_probabilities="[A, B, C, D]", img=sem_map_frontier)
-                                # print(Meta_Choice)
-
-                                # Meta_Score, Meta_Choice = cogvlm2.COT2(User_Prompt1=Single_Prompt, 
-                                #                             User_Prompt2=Meta_Prompt,
-                                                            # cot_pred1=Single_Choice,
-                                                            # return_string_probabilities="[A, B, C, D]", img=sem_map_frontier)
-                                Final_PR = Perception_weight_decision4(Meta_Score, Meta_Choice)
-                                
-                            else:
-                                # 由于不稳定性，将其替换为分数最高的nodes
-                                # Meta_Prompt = form_prompt_for_DecisionVLM_History(pre_goal_points[j], goal_name, start, history_score_copy, history_nodes_copy)
-                                # Meta_Score, Meta_Choice = cogvlm2.COT3(User_Prompt1=VLM_Perception_Prompt, 
-                                #                             User_Prompt2=FN_Prompt,
-                                                            # User_Prompt3=Meta_Prompt,
-                                                            # cot_pred1=Perception_Pred,
-                                                            # cot_pred2=FN_Decision,
-                                                            # return_string_probabilities="[a, b, c, d]", img=full_rgb)
-                                # Decisions.append(Meta_Choice)
-                                # Final_PR = Perception_weight_decision26(Meta_Score, Meta_Choice)
-                                Final_PR = history_score_copy
-
-                            logging.info(f"Agent_{j}--Final_PR: {Final_PR}")
-
-                            # Scores.append(Final_PR)
-                            Choice = Final_PR.index(max(Final_PR))
-                            
-                            
-                            if FN_PR[0] >= 0.3 or agent[j].l_step <= 125:
-                                logging.info(f"VLM Choice: Agent_{j}-frontier_{Choice}")
-                                Choice2 = Meta_Score.index(max(Meta_Score))
-                                if len(full_Frontiers_dict) == 1:
-                                    goal_points[j] = [int(x) for x in full_Frontiers_dict['frontier_0'].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
-                                else:
-                                    if j > 0:
-                                        if len(missing_key_F) != 0:
-                                            for keys in missing_key_F:
-                                                frontier_keys.remove(keys)
-                                    else:
-                                        frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2', 'frontier_3']
-
-                                    invalid_answer = False
-                                    for i, key in enumerate(frontier_keys):
-                                        if Choice == i:
-                                            if key in full_Frontiers_dict_copy:
-                                                goal_points[j] = [int(x) for x in full_Frontiers_dict_copy[key].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
-                                                del full_Frontiers_dict_copy[key]
-                                            else:
-                                                invalid_answer = True
-                                            break
-                                    if invalid_answer:
-                                        for i, key in enumerate(frontier_keys):
-                                            if Choice2 == i:
-                                                try:
-                                                    goal_points[j] = [int(x) for x in full_Frontiers_dict_copy[key].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
-                                                    del full_Frontiers_dict_copy[key]
-                                                    break
-                                                except:
-                                                    goal_points[j] = [int(x) for x in full_Frontiers_dict_copy[frontier_keys[0]].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
-                                                    del full_Frontiers_dict_copy[frontier_keys[0]]
-                                                    break
-                                        
-
-                            else:
-                                logging.info(f"VLM Choice: Agent_{j}-history_{Choice}")
-                                if len(history_nodes_copy)==1:
-                                    goal_points[j] = history_nodes_copy[0]
-                                else:
-                                    for i in range(len(history_nodes_copy)):
-                                        if Choice == i:
-                                            goal_points[j] = history_nodes_copy[i]
-                                            del history_nodes_copy[i]
-                                            del history_score_copy[i]
-                                            break
-
-                            
-                            
-                        else:
-                            logging.info(f'===== Agent_{j} No Frontier, Random Mode =====')
-                            #### 修改为历史node
-                            # actions = np.random.rand(1, 2).squeeze()*(full_target_edge_map.shape[0] - 1)
-                            # goal_points[j] = [int(actions[0]), int(actions[1])]
-                            
-                            # Frontiers_dict = {}
-                            # for k in range(len(agent_TargetPointMap[j])):
-                            #     Frontiers_dict['frontier_' + str(k)] = f"<centroid: {agent_TargetPointMap[j][k][0], agent_TargetPointMap[j][k][1]}, number: {agent_FrontierList[j][k]}>"
-                            # Agent States
-                            agent[j].is_Frontier = False
-                            c_angle = int(start_o % 360)
-                            angle_score = Perception_PR[0] * 2
-                            agent[j].angle_score = angle_score
-
-                            if is_exist_oldhistory == False:
-                                if c_angle >= 39 and c_angle < 321:
-                                    history_state[c_angle-39:c_angle+39] = angle_score
-                                elif c_angle < 39:
-                                    history_state[:c_angle+39] = angle_score
-                                    history_state[360-c_angle-39:] = angle_score
-
-                                elif c_angle >= 321:
-                                    history_state[c_angle-39:] = angle_score
-                                    history_state[:c_angle+39-360] = angle_score
-                                h_score = history_state.sum()
-                                history_states.append(history_state)
-                                history_score.append(h_score)
-                            else:
-                                if c_angle >= 39 and c_angle < 321:
-                                    history_states[closest_index][c_angle-39:c_angle+39] = angle_score
-                                elif c_angle < 39:
-                                    history_states[closest_index][:c_angle] = angle_score
-                                    history_states[closest_index][360-c_angle:] = angle_score
-                                elif c_angle >= 321:
-                                    history_states[closest_index][c_angle:] = angle_score
-                                    history_states[closest_index][:360-c_angle] = angle_score
-                                h_score = history_states[closest_index].sum() / history_count[closest_index]
-                                history_score[closest_index] = h_score
-
-                            if j == 0:
-                                history_nodes_copy = history_nodes.copy()
-                                history_score_copy = history_score.copy()
-                                full_Frontiers_dict_copy = full_Frontiers_dict.copy()
-                            
-                            if len(full_Frontiers_dict) == 1:
-                                logging.info(f'=====> Agent_{j} state: Step: {agent[j].l_step}; Angle: {start_o}')
-                                actions = np.random.rand(1, 2).squeeze()*(full_target_edge_map.shape[0] - 1)
-                                goal_points[j] = [int(actions[0]), int(actions[1])]
-                            else:
-                                if  j == 0:
-                                    frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2', 'frontier_3']
-                                logging.info(f'=====> Agent_{j} state: Step: {agent[j].l_step}; Angle: {start_o}')
-                                actions = np.random.rand(1, 2).squeeze()*(full_target_edge_map.shape[0] - 1)
-                                goal_points[j] = [int(actions[0]), int(actions[1])]
-                            
-                            
-                    
-                    # all_objs.append(agent_objs) 
-                    # all_VLM_Pred.append(agents_VLM_Pred)
-                    # all_VLM_PR.append(agents_VLM_PR)
-
-                else:
-                    
-                    logging.info(f'===== No Frontier, Random Mode===== ')
-                    logging.info(f'=====> Agent_{j} state: Step: {agent[j].l_step}; Angle: {start_o}')
-                    
-                    for j in range(num_agents):
-                        agent[j].is_Frontier = False
-                        rgb = observations[j]['rgb'].astype(np.uint8)
-                        
-                        # full_rgb1.append(full_rgb)
-                        all_rgb.append(rgb)
-                        goal_name = agent[j].goal_name
-                        if args.yolo == 'yolov9':
-                            agent_objs[f"agent_{j}"] = yolo.run(rgb) # 记录一个时间步内每个智能体的目标检测信息
-                        else:
-                            yolo_output = yolo(source=rgb,conf=0.2)
-                            yolo_mapping = [yolo_output[0].names[int(c)] for c in yolo_output[0].boxes.cls]
-                            agent_objs[f"agent_{j}"] = {k: v for k, v in zip(yolo_mapping, yolo_output[0].boxes.conf)}
-                        # logging.info(agent_objs)
-
-                        start_x, start_y, start_o, gx1, gx2, gy1, gy2 = agent[j].planner_pose_inputs
-                        r, c = start_y, start_x
-                        start = [int(r * 100.0 / args.map_resolution - gx1),
-                                int(c * 100.0 / args.map_resolution - gy1)]
-                        start = pu.threshold_poses(start, agent[j].local_map[0, :, :].cpu().numpy().shape)
-                        
-                        cur_goal_points.append(start)
-
-                        #### 感知VLM
-                        Caption_Prompt, VLM_Perception_Prompt = form_prompt_for_PerceptionVLM(goal_name, agent_objs[f'agent_{j}'], args.yolo)
-                        _, Scene_Information = cogvlm2.simple_image_chat(User_Prompt=Caption_Prompt, 
-                                                                        return_string_probabilities=None, img=rgb)
-                        Perception_Rel, Perception_Pred = cogvlm2.COT2(User_Prompt1=Caption_Prompt, 
-                                                                       User_Prompt2=VLM_Perception_Prompt,
-                                                                       cot_pred1=Scene_Information,
-                                                                       return_string_probabilities="[Yes, No]", img=rgb)
-                        Perception_Rel = np.array(Perception_Rel)
-                        Perception_PR = Perception_weight_decision(Perception_Rel, Perception_Pred)
-                        logging.info(f"Agent_{j}--VLM_PerceptionPR: {Perception_PR}")
-
-                        is_exist_oldhistory = False
-                        if len(history_nodes) > 0:
-                            closest_index = -1
-                            min_distance = float('inf')
-                            new_x, new_y = start
-                            for i, (x, y) in enumerate(history_nodes):
-                                distance = math.sqrt((x - new_x) * (x - new_x) + (y - new_y) * (y - new_y))
-                                if distance < 25 and distance < min_distance:
-                                    min_distance = distance
-                                    closest_index = i
-                                    is_exist_oldhistory = True
-
-                            if  is_exist_oldhistory == False:
-                                history_nodes.append(start)
-                                history_count.append(1)
-                                history_state = np.zeros(360)
-                            else:
-                                history_count[closest_index] = history_count[closest_index] + 1
-
-                            
-                        else:
-                            history_nodes.append(start)
-                            history_count.append(1)
-                            history_state = np.zeros(360)
-
-
-                        angle_score = Perception_PR[0] * 2
-                        agent[j].angle_score = angle_score
-                        c_angle = int(start_o % 360)
-
-                        if is_exist_oldhistory == False:
-                            if c_angle >= 39 and c_angle < 321:
-                                history_state[c_angle-39:c_angle+39] = angle_score
-                            elif c_angle < 39:
-                                history_state[:c_angle+39] = angle_score
-                                history_state[360-c_angle-39:] = angle_score
-
-                            elif c_angle >= 321:
-                                history_state[c_angle-39:] = angle_score
-                                history_state[:c_angle+39-360] = angle_score
-                            h_score = history_state.sum()
-                            history_states.append(history_state)
-                            history_score.append(h_score)
-                        else:
-                            if c_angle >= 39 and c_angle < 321:
-                                history_states[closest_index][c_angle-39:c_angle+39] = angle_score
-                            elif c_angle < 39:
-                                history_states[closest_index][:c_angle] = angle_score
-                                history_states[closest_index][360-c_angle:] = angle_score
-                            elif c_angle >= 321:
-                                history_states[closest_index][c_angle:] = angle_score
-                                history_states[closest_index][:360-c_angle] = angle_score
-                            h_score = history_states[closest_index].sum() / history_count[closest_index]
-                            history_score[closest_index] = h_score
-
-
-                        actions = np.random.rand(1, 2).squeeze()*(full_target_edge_map.shape[0] - 1)
-                        goal_points[j] = [int(actions[0]), int(actions[1])]
-
-                        
-                    
-
-                # 当前场景值得探索，且智能体并没有到Frontier
-                for i in range(num_agents):
-                    if len(pre_g_points) == 0:
-                        break
-                    if calculate_distance(cur_goal_points[i], pre_g_points[i]) >= 25 and agent[i].is_Frontier == True:
-                        # print(calculate_distance(cur_goal_points[i], pre_g_points[i]))
-                        goal_points[i] = pre_g_points[i]
-
-                # Local_Policy = 1
-                # 判断距离，如果两次间隔距离过短就选择随机点进行导航
-                for i in range(num_agents):
-                    if len(pre_goal_points) > 0 and calculate_distance(pre_goal_points[i], cur_goal_points[i]) <= 2.5:
-                        actions = np.random.rand(1, 2).squeeze()*(full_target_edge_map.shape[0] - 1)
-                        goal_points[i] = [int(actions[0]), int(actions[1])]
-                
-
-                # logging.info(f"pre_g_points: {pre_g_points}")        
-                
-                logging.info(f"goal_points: {goal_points}")
-                pre_g_points = goal_points.copy()
-                logging.info("===== Starting local strategy ===== ")
-            
-            
-
-            for i in range(num_agents):
-                # 如果有智能体找到终点，直接导航过去
-                if len(target_point) > 0:
-                    for j in range(num_agents):
-                        goal_points[j] = target_point
-                action[i] = agent[i].act(goal_points[i])
-                if action[i] == 0:
-                    start_x, start_y, start_o, gx1, gx2, gy1, gy2 = agent[i].planner_pose_inputs
-                    r, c = start_y, start_x
-                    start = [int(r * 100.0 / args.map_resolution - gx1),
-                            int(c * 100.0 / args.map_resolution - gy1)]
-                    start = pu.threshold_poses(start, agent[i].local_map[0, :, :].cpu().numpy().shape)
-                    target_point = start.copy()
-            # logging.info(f"actions: {action}")
-            observations = env.step(action)
-            
-            # exit(0)
-                    
-            
-                        
-            # if count_rotating == 2:
-            #     exit(0)
-            # ------------------------------------------------------------------
-
-                # Debug: 不画图
-            
-            if args.visualize or args.print_images: 
-                if num_agents == 1:
-                    vis_ep_dir = '{}/episodes/eps_{}/Agent0_vis'.format(
-                        dump_dir, agent[0].episode_n)
-                    if not os.path.exists(vis_ep_dir):
-                        os.makedirs(vis_ep_dir)
-                    Legend = cv2.imread("img/legend.png")
-                    height, _ = sem_map.shape[:2]
-                    legend_resized = cv2.resize(Legend, (Legend.shape[1], height))
-                    img_show = np.hstack((sem_map, legend_resized))
-                    fn = '{}/episodes/eps_{}/Agent0_vis/VisStep-{}.png'.format(
-                        dump_dir, agent[0].episode_n,
-                        agent[0].l_step)
-                    # print(fn)
-                    cv2.imwrite(fn, img_show)  
-
-
-                Visualize(args, agent[0].episode_n, agent[0].l_step, pose_pred, full_map_pred, 
-                        agent[0].goal_id, visited_vis, full_target_edge_map, Frontiers_dict=None, goal_points=goal_points)
-                
-
-                # exit(0)
-            
-
-            # logging.info(f"full_map_pred.shape: {full_map_pred.shape}") # [20,480,480] HM-3D
-        
-        count_episodes += 1
-        count_step += agent[0].l_step
+        self.device = args.device = device
 
         # ------------------------------------------------------------------
-        ##### Logging
+        ##### Semantic detecttion init SAM
         # ------------------------------------------------------------------
-        log_end = time.time()
-        time_elapsed = time.gmtime(log_end - log_start)
-        log = " ".join([
-            "Time: {0:0=2d}d".format(time_elapsed.tm_mday - 1),
-            "{},".format(time.strftime("%Hh %Mm %Ss", time_elapsed)),
-            "num timesteps {},".format(count_step),
-            "FPS {},".format(int(count_step / (log_end - log_start)))
-        ]) + '\n'
+        # if self.args.use_sam:
+        #     use_ram = args.tag_freq > 0
+        #     while True:
+                # try:
+                #     self.GSAM = GSAM(self.object_category[:-1], text_threshold=args.text_threshold, device=self.device, use_ram=use_ram)
+                #     break
+                # except Exception as ex:
+                #     logging.info(f"[ERROR]: {ex}, sleep for 20s...")
+                #     time.sleep(20)
+                #     continue
+        
+        # ------------------------------------------------------------------
+        ##### Semantic detecttion init RedNet
+        # ------------------------------------------------------------------
+        # else:
+        self.sem_pred = SemanticPredMaskRCNN(args)
+        self.red_sem_pred = load_rednet(
+            self.device, ckpt='RedNet/model/rednet_semmap_mp3d_40.pth', 
+            resize=True, # since we train on half-vision
+        )
+        self.red_sem_pred.eval()
+        self.red_sem_pred.to(self.device)
 
-        metrics = env.get_metrics()
-        for m, v in metrics.items():
-            if isinstance(v, dict):
-                for sub_m, sub_v in v.items():
-                    agg_metrics[m + "/" + str(sub_m)] += sub_v
+        # ------------------------------------------------------------------
+
+        # ------------------------------------------------------------------
+        ##### initializations for planning:
+        # ------------------------------------------------------------------
+        self.selem = skimage.morphology.disk(3)
+
+        self.last_sim_location = None
+        self.collision_map = None
+        self.visited = None
+        self.visited_vis = None
+        self.last_action = None
+        self.col_width = None
+        self.l_step = 0
+        self.episode_n = 0
+        self.collision_n = 0
+
+        self.collision_s = 0
+        self.replan_count = 0
+        self.replan_flag = 0
+        # ------------------------------------------------------------------
+
+        # ------------------------------------------------------------------
+        ##### Visualization init
+        # ------------------------------------------------------------------
+        if args.visualize or args.print_images:
+            self.vis_image = None
+            self.rgb_vis = None
+            self.set_legend()
+
+        # initialize transform for RGB observations
+        self.res = transforms.Compose(
+            [transforms.ToPILImage(),
+             transforms.Resize((args.frame_height, args.frame_width),
+                               interpolation=Image.NEAREST)])
+
+        # ------------------------------------------------------------------
+        
+
+        # ------------------------------------------------------------------
+        ##### Initialize map variables:
+        ##### Full map consists of multiple channels containing the following:
+        ##### 1. Obstacle Map
+        ##### 2. Exploread Area
+        ##### 3. Current Agent Location
+        ##### 4. Past Agent Locations
+        ##### 5,6,7,.. : Semantic Categories
+        # ------------------------------------------------------------------
+        nc = args.num_sem_categories + 4  # num channels
+
+        # Calculating full and local map sizes
+        self.map_size = args.map_size_cm // args.map_resolution
+        self.full_w, self.full_h = self.map_size, self.map_size
+        self.local_w = int(self.full_w / args.global_downscaling)
+        self.local_h = int(self.full_h / args.global_downscaling)
+
+        # Initializing full and local map
+        self.full_map = torch.zeros(nc, self.full_w, self.full_h).float().to(self.device)
+        self.local_map = torch.zeros(nc, self.local_w,
+                                self.local_h).float().to(self.device)
+
+        self.local_ob_map = np.zeros((self.local_w,
+                                self.local_h))
+
+        self.local_ex_map = np.zeros((self.local_w,
+                                self.local_h))
+
+        self.target_edge_map = np.zeros((self.local_w,
+                                self.local_h))
+
+        self.target_point_map = np.zeros((self.local_w,
+                                self.local_h))
+
+        self.kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(3, 3))
+        self.tv_kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(7, 7))
+        
+
+        # Initial full and local pose
+        self.full_pose = torch.zeros(3).float().to(self.device)
+        self.local_pose = torch.zeros(3).float().to(self.device)
+
+        # Origin of local map
+        self.origins = np.zeros(3)
+
+        # Local Map Boundaries
+        self.lmb = np.zeros(4).astype(int)
+
+        self.eve_angle = 0
+
+        # Planner pose inputs has 7 dimensions
+        # 1-3 store continuous global agent location
+        # 4-7 store local map boundaries
+        self.planner_pose_inputs = np.zeros(7)
+
+        self.init_map_and_pose()
+
+        # ------------------------------------------------------------------
+        ##### Semantic Mapping init
+        # ------------------------------------------------------------------
+        self.sem_map_module = Semantic_Mapping(args).to(self.device)
+        self.sem_map_module.eval()
+
+        # ------------------------------------------------------------------
+        ##### Pred Map init
+        # ------------------------------------------------------------------
+        self.color_map = None
+        self.explo_area_map = None
+
+        # ------------------------------------------------------------------
+        ##### EXIT Rotation state init
+        # ------------------------------------------------------------------
+        self.EXIT = False
+        self.Perception_PR = 0
+        self.Max_Perception_Angle = 360
+        self.count_rerotation = 0
+        self.angle_score = 0
+        self.is_Frontier = True
+
+        self.Find_Goal = False
+
+
+
+
+
+    def reset(self) -> None:
+
+        self.init_map_and_pose()
+
+        self.l_step = 0
+        self.last_action = None
+        self.col_width = 1
+
+        self.episode_n += 1
+        self.collision_n = 0
+        self.replan_count = 0
+        self.replan_flag = 0
+        self.stop = 0
+
+        self.eve_angle = 0
+
+        self.stair_flag = 0
+
+        self.goal_name = None
+        self.goal_id = None
+
+        self.curr_loc = [self.args.map_size_cm / 100.0 / 2.0,
+                         self.args.map_size_cm / 100.0 / 2.0, 0.]
+
+        map_shape = (self.map_size, self.map_size)
+        self.collision_map = np.zeros(map_shape)
+        self.visited = np.zeros(map_shape)
+        self.visited_vis = np.zeros(map_shape)
+        # print(self.episode_n)
+        self.Find_Goal = False
+        self.Start_Location = None
+        self.Path_Length = 1e-5
+
+    def set_legend(self):
+        save_legend(self.object_category)
+        self.legend = cv2.imread('img/legend.png')
+        h, w = self.legend.shape[0], self.legend.shape[1]
+        self.legend = cv2.resize(self.legend,
+                                    (int(w*980/h), 980),
+                                    interpolation=cv2.INTER_NEAREST)
+        lx, ly = self.legend.shape[0], self.legend.shape[1]
+        if self.vis_image is not None:
+            self.vis_image[50:, 1165+500:, :] = 255
+            try:
+                self.vis_image[50:50 + lx, 1165+500:1165+500 + ly, :] = self.legend
+            except:
+                logging.info("legend error!")
+        
+
+    def mapping(self, observations: Observations):
+
+        # ------------------------------------------------------------------
+        ##### At first step, get the object name and init the visualization
+        # ------------------------------------------------------------------
+        if self.l_step == 0:
+            self.last_sim_location = [observations['gps'][0], observations['gps'][1], observations['compass'][0]]
+            self.local_pose[2] = observations['compass'][0]* 57.29577951308232
+
+            self.local_pose[2] = torch.fmod(self.local_pose[2] - 180.0, 360.0) + 180.0
+            self.local_pose[2] = torch.fmod(self.local_pose[2] + 180.0, 360.0) - 180.0
+
+            actions = torch.randn(1, 2)*6
+            cpu_actions = nn.Sigmoid()(actions).cpu().numpy().squeeze()
+            global_goals = [int(cpu_actions[0] * self.local_w),
+                             int(cpu_actions[1] * self.local_h)]
+            self.global_goals = [min(global_goals[0], int(self.local_w - 1)),
+                             min(global_goals[1], int(self.local_h - 1))] 
+            
+            if 'objectgoal' not in observations:
+                possible_cats = list(np.arange(6))
+                goal_idx = np.random.choice(possible_cats)
+                self.goal_id = goal_idx
+                for key, value in gibson_coco_categories.items():
+                    if value == goal_idx:
+                        self.goal_name = key
+
+                if self.args.visualize or self.args.print_images:
+                    self.vis_image = vu.init_vis_image(self.goal_name, 0)
+
             else:
-                agg_metrics[m] += v
-        
-        for k, v in agg_metrics.items():
-            if k == 'success_rate':
-                for i in range(num_agents):
-                    if agent[i].Find_Goal:
-                        agg_metrics[k] += 1
-                        if agg_metrics[k] > count_episodes:
-                            agg_metrics[k] = count_episodes
-                        break
+                if 'objectnav_mp3d' in self.args.task_config:
+                    self.goal_name = self.object_category[observations['objectgoal'][0]]
+                elif 'objectnav_hm3d' in self.args.task_config:
+                    self.goal_name = self.object_category[coco_categories_hm3d2mp3d[observations['objectgoal'][0]]]
+                self.goal_id = observations['objectgoal'][0]
 
+                if self.args.visualize or self.args.print_images:
+                    if 'objectnav_mp3d' in self.args.task_config:
+                        self.vis_image = vu.init_vis_image(self.object_category[observations['objectgoal'][0]], 0)
+                    elif 'objectnav_hm3d' in self.args.task_config:
+                        self.vis_image = vu.init_vis_image(self.object_category[coco_categories_hm3d2mp3d[observations['objectgoal'][0]]], 0)
+            # print("objectgoal: ", observations['objectgoal'])
 
-
-        log += ", ".join(k + ": {:.3f}".format(v / count_episodes) for k, v in agg_metrics.items() if k !='success') + " ---({:.0f}/{:.0f})".format(count_episodes, num_episodes)
-
-        # log += "Total usage: " + str(sum(total_usage)) + ", average usage: " + str(np.mean(total_usage))
-        print(log)
-        logging.info(log)
-        fn = '{}/TEST.log'.format(log_dir)
-        if count_episodes == 1:
-            with open(fn,'w', encoding='utf-8') as f:
-                f.write(log)
-                f.write('\n')
-        else:
-            with open(fn,'a', encoding='utf-8') as f:
-                f.write(log)
-                f.write('\n')
+            if 'objectgoal' in observations:
+                if observations['objectgoal'][0] == 3:
+                    return 0
         # ------------------------------------------------------------------
 
 
-    avg_metrics = {k: v / count_episodes for k, v in agg_metrics.items()}
+        # ------------------------------------------------------------------
+        ##### Preprocess the observation
+        # ------------------------------------------------------------------
+        rgb = observations['rgb'].astype(np.uint8)
+        depth = observations['depth']
+        state = np.concatenate((rgb, depth), axis=2).transpose(2, 0, 1)
 
-    return avg_metrics
+        if self.args.use_sam:
+            isChanged = (len(self.object_category) != len(object_category))
+            self.object_category = deepcopy(object_category)
+            if isChanged:
+                self.GSAM.set_text(object_category[:-1])
+                self.set_legend()
+
+            obs = self._preprocess_obs(state) 
+        else:
+            obs = self._preprocess_obs_rednet(state) 
+
+        obs = torch.from_numpy(obs).float().to(self.device)
+        # ------------------------------------------------------------------
+
+        # ------------------------------------------------------------------
+        ##### local semantic map updating
+        # ------------------------------------------------------------------
+        poses = torch.from_numpy(np.asarray(self.get_pose_change(observations['gps'], observations['compass']))).float().to(self.device)
+        
+        points, self.local_map, self.local_map_stair, self.local_pose = \
+            self.sem_map_module(obs.unsqueeze(0), poses.unsqueeze(0), self.local_map.unsqueeze(0), self.local_pose.unsqueeze(0), self.eve_angle)
+
+
+        locs = self.local_pose.cpu().numpy()
+        self.planner_pose_inputs[:3] = locs + self.origins
+        self.local_map[2, :, :].fill_(0.)  # Resetting current location channel
+        r, c = locs[1], locs[0]
+        loc_r, loc_c = [int(r * 100.0 / self.args.map_resolution),
+                        int(c * 100.0 / self.args.map_resolution)]
+        self.local_map[2:4, loc_r - 2:loc_r + 3, loc_c - 2:loc_c + 3] = 1.
+
+        # ------------------------------------------------------------------
+
+        # ------------------------------------------------------------------
+        ##### Outlines for stucking
+        # ------------------------------------------------------------------
+        if self.replan_count > self.args.num_local_steps-5 and torch.any(self.local_map[18, :, :]>0):
+            self.replan_flag = 1
+
+        # clear the obstacle during the stairs
+        # if (torch.any(self.local_map[18, loc_r-10:loc_r+10, loc_c-10:loc_c+10] > 0) and self.replan_flag) or self.local_map[18, loc_r, loc_c] > 0:
+        # if  self.replan_flag or self.local_map[18, loc_r-1, loc_c-1] > 0.5:
+        #     self.stair_flag = 1
+        # # else:
+        # #     self.stair_flag = 0
+
+        # if self.stair_flag:
+        #     self.local_map[0, :, :] = self.local_map_stair[0, :, :]
+
+        if self.replan_flag:
+        #     # must > 0
+            self.local_map[0, :, :][self.local_map[18, :, :] > 0] = 0
+        # ------------------------------------------------------------------
+
+        
+        frontier_score_list = []
+
+
+        # ------------------------------------------------------------------
+        ##### Global Policy
+        # ------------------------------------------------------------------
+        if self.l_step % self.args.num_local_steps == self.args.num_local_steps - 1:
+            # ------------------------------------------------------------------
+            ##### Random Policy if no frontiers 
+            # ------------------------------------------------------------------
+            actions = torch.randn(1, 2)*1
+            cpu_actions = nn.Sigmoid()(actions).cpu().numpy().squeeze()
+            global_goals = [int(cpu_actions[0] * self.local_w),
+                            int(cpu_actions[1] * self.local_h)]
+            self.global_goals = [min(global_goals[0], int(self.local_w - 1)),
+                            min(global_goals[1], int(self.local_h - 1))] 
+                # print("self.global_goals: ", self.global_goals)
+
+            # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        ##### For every global step, update the full maps
+        # ------------------------------------------------------------------
+        self.full_map[:, self.lmb[0]:self.lmb[1], self.lmb[2]:self.lmb[3]] = \
+            self.local_map
+        self.full_pose = self.local_pose + \
+            torch.from_numpy(np.asarray(self.origins)).to(self.device).float()
+
+        locs = self.full_pose.cpu().numpy()
+        r, c = locs[1], locs[0]
+        loc_r, loc_c = [int(r * 100.0 / self.args.map_resolution),
+                        int(c * 100.0 / self.args.map_resolution)]
+
+        self.lmb = self.get_local_map_boundaries((loc_r, loc_c),
+                                        (self.local_w, self.local_h),
+                                        (self.full_w, self.full_h))
+
+        self.planner_pose_inputs[3:] = self.lmb
+        self.origins = [self.lmb[2] * self.args.map_resolution / 100.0,
+                    self.lmb[0] * self.args.map_resolution / 100.0, 0.]
+
+        self.local_map = self.full_map[:,
+                                self.lmb[0]:self.lmb[1],
+                                self.lmb[2]:self.lmb[3]]
+        self.local_pose = self.full_pose - \
+            torch.from_numpy(np.asarray(self.origins)).to(self.device).float()
+
+        if self.replan_count > self.args.num_local_steps-5 or self.collision_n > self.args.num_local_steps - 5:
+            self.collision_n = 0
+            self.local_map.fill_(0.)
+        else:
+            self.collision_n = 0
+        # ------------------------------------------------------------------
+        
+
     
+    def act(self, goal_points: list, )-> Dict[str, int]:
+        # ------------------------------------------------------------------
+        ##### Update long-term goal if target object is found
+        ##### Otherwise, use the VLM to select the goal
+        # ------------------------------------------------------------------
+        # Rotating
+        # if is_rotating:
+        #     action = 3
+        #     self.last_action = action
+        #     self.l_step += 1
+        #     return action
 
-if __name__ == "__main__":
-    main()
+        found_goal = 0
+    
+        local_goal_maps = np.zeros((self.local_w, self.local_h)) 
+
+        local_goal_maps[goal_points[0],goal_points[1]] = 1
+            # print("Don't Find the edge")
+
+        if 'objectnav_mp3d' in self.args.task_config:
+            cn = self.goal_id
+        elif 'objectnav_hm3d' in self.args.task_config:
+            cn = coco_categories[self.goal_id] + 4
+        if self.local_map[cn, :, :].sum() != 0.:
+            logging.info("==========> Find Goal!")
+            cat_semantic_map = self.local_map[cn, :, :].cpu().numpy()
+            cat_semantic_scores = cat_semantic_map
+            cat_semantic_scores[cat_semantic_scores > 0] = 1.
+            if cn == 9:
+                cat_semantic_scores = cv2.dilate(cat_semantic_scores, self.tv_kernel)
+            local_goal_maps = self.find_big_connect(cat_semantic_scores)
+            found_goal = 1
+            self.Find_Goal = True
+     
+        # ------------------------------------------------------------------
+
+        # ------------------------------------------------------------------
+        ##### Take action based on the goal
+        # ------------------------------------------------------------------
+        planner_inputs = {}
+        # self.planner_pose_inputs[3:] = [0, self.local_w, 0, self.local_h]
+        planner_inputs['map_pred'] = self.local_map[0, :, :].cpu().numpy()
+        planner_inputs['exp_pred'] = self.local_map[1, :, :].cpu().numpy()
+        planner_inputs['pose_pred'] = self.planner_pose_inputs
+        planner_inputs['goal'] = local_goal_maps  # global_goals[e]
+        planner_inputs['map_target'] = self.target_point_map  # global_goals[e]
+        planner_inputs['new_goal'] = (self.l_step % self.args.num_local_steps - 1) == 0
+        planner_inputs['found_goal'] = found_goal
+        if self.args.visualize or self.args.print_images:
+            planner_inputs['map_edge'] = self.target_edge_map
+            self.local_map[-1, :, :] = 1e-5
+            planner_inputs['sem_map_pred'] = self.local_map[4:, :,
+                                            :].argmax(0).cpu().numpy()
+        
+        action = self._plan(planner_inputs)
+        # print("self.l_step: ", self.l_step)
+        # print("action: ", action)
+
+        self.last_action = action
+        self.l_step += 1
+
+        if self.args.visualize or self.args.print_images:
+            self._visualize(planner_inputs, action)
+
+        return action
+
+    def _plan(self, planner_inputs):
+        """Function responsible for planning
+
+        Args:
+            planner_inputs (dict):
+                dict with following keys:
+                    'map_pred'  (ndarray): (M, M) map prediction
+                    'goal'      (ndarray): (M, M) goal locations
+                    'pose_pred' (ndarray): (7,) array  denoting pose (x,y,o)
+                                 and planning window (gx1, gx2, gy1, gy2)
+                    'found_goal' (bool): whether the goal object is found
+
+        Returns:
+            action (int): action id
+        """
+        # if planner_inputs["new_goal"]:
+        #     self.collision_map = np.zeros(self.visited.shape)
+
+        args = self.args
+
+        self.last_loc = self.curr_loc
+
+        # Get Map prediction
+        map_pred = np.rint(planner_inputs['map_pred'])
+        exp_pred = np.rint(planner_inputs['exp_pred'])
+        goal = planner_inputs['goal']
+
+        # Get pose prediction and global policy planning window
+        start_x, start_y, start_o, gx1, gx2, gy1, gy2 = \
+            planner_inputs['pose_pred']
+        gx1, gx2, gy1, gy2 = int(gx1), int(gx2), int(gy1), int(gy2)
+        planning_window = [gx1, gx2, gy1, gy2]
+        # print("pose_pred:",planner_inputs['pose_pred'])
+        # print("start_x:",start_x)
+        # print("start_y:",start_y)
+        # print("start_o:",start_o)
+
+        # Get curr loc
+        self.curr_loc = [start_x, start_y, start_o]
+        r, c = start_y, start_x
+        start = [int(r * 100.0 / args.map_resolution - gx1),
+                 int(c * 100.0 / args.map_resolution - gy1)]
+        start = pu.threshold_poses(start, map_pred.shape)
+
+        self.visited[gx1:gx2, gy1:gy2][start[0] - 0:start[0] + 1,
+                                       start[1] - 0:start[1] + 1] = 1
+
+        # if args.visualize or args.print_images:
+            # Get last loc
+        last_start_x, last_start_y = self.last_loc[0], self.last_loc[1]
+        r, c = last_start_y, last_start_x
+        last_start = [int(r * 100.0 / args.map_resolution - gx1),
+                        int(c * 100.0 / args.map_resolution - gy1)]
+        last_start = pu.threshold_poses(last_start, map_pred.shape)
+        self.visited_vis[gx1:gx2, gy1:gy2] = \
+            vu.draw_line(last_start, start,
+                            self.visited_vis[gx1:gx2, gy1:gy2])
+        if self.l_step == 0:
+            self.Start_Location = last_start
+        self.Path_Length += pu.get_l2_distance(last_start[0],start[0],last_start[1],start[1])
+
+
+        # Collision check
+        if self.last_action == 1 and not planner_inputs["new_goal"]:
+            x1, y1, t1 = self.last_loc
+            x2, y2, _ = self.curr_loc
+            buf = 4
+            length = 2
+
+            if abs(x1 - x2) < 0.05 and abs(y1 - y2) < 0.05:
+                self.col_width += 2
+                if self.col_width == 7:
+                    length = 4
+                    buf = 3
+                self.col_width = min(self.col_width, 5)
+            else:
+                self.col_width = 1
+
+            dist = pu.get_l2_distance(x1, x2, y1, y2)
+            if dist < args.collision_threshold:  # Collision
+                self.collision_n += 1
+                width = self.col_width
+                for i in range(length):
+                    for j in range(width):
+                        wx = x1 + 0.05 * \
+                            ((i + buf) * np.cos(np.deg2rad(t1))
+                             + (j - width // 2) * np.sin(np.deg2rad(t1)))
+                        wy = y1 + 0.05 * \
+                            ((i + buf) * np.sin(np.deg2rad(t1))
+                             - (j - width // 2) * np.cos(np.deg2rad(t1)))
+                        r, c = wy, wx
+                        r, c = int(r * 100 / args.map_resolution), \
+                            int(c * 100 / args.map_resolution)
+                        [r, c] = pu.threshold_poses([r, c],
+                                                    self.collision_map.shape)
+                        self.collision_map[r, c] = 1
+
+        # # start_stg = time.time()
+        # print(map_pred)
+        # np.savetxt('panao_mappred.txt', map_pred, fmt='%.2f', delimiter=' ')
+        # # print(start)
+        # print(np.copy(goal))
+        # np.savetxt('panaogoal.txt', np.copy(goal), fmt='%.2f', delimiter=' ')
+        # print(planning_window)
+        stg, stop = self._get_stg(map_pred, start, np.copy(goal),
+                                  planning_window)
+        
+        # print("stg:",stg)
+        # exit(0)
+        # stg_end = time.time()
+        # stg_time = stg_end - start_stg
+        # print('act_time: %.3f秒'%stg_time)
+
+        # Deterministic Local Policy
+        # print("planner_inputs['found_goal']:",planner_inputs['found_goal'])
+        # print("stop:",stop)
+        if stop and planner_inputs['found_goal'] == 1:
+            action = 0  # Stop
+        else:
+            (stg_x, stg_y) = stg
+            angle_st_goal = math.degrees(math.atan2(stg_x - start[0],
+                                                    stg_y - start[1]))
+            
+            # print("start_o:",start_o)
+            
+            angle_agent = (start_o) % 360.0
+            if angle_agent > 180:
+                angle_agent -= 360
+
+            relative_angle = (angle_agent - angle_st_goal) % 360.0
+            if relative_angle > 180:
+                relative_angle -= 360
+
+            ## add the evelution angle
+            eve_start_x = int(5 * math.sin(angle_st_goal) + start[0])
+            eve_start_y = int(5 * math.cos(angle_st_goal) + start[1])
+            if eve_start_x >= map_pred.shape[0]: eve_start_x = map_pred.shape[0]-1
+            if eve_start_y >= map_pred.shape[0]: eve_start_y = map_pred.shape[0]-1 
+            if eve_start_x < 0: eve_start_x = 0 
+            if eve_start_y < 0: eve_start_y = 0 
+            if exp_pred[eve_start_x, eve_start_y] == 0 and self.eve_angle > -60:
+                action = 5
+                self.eve_angle -= 30
+            elif exp_pred[eve_start_x, eve_start_y] == 1 and self.eve_angle < 0:
+                action = 4
+                self.eve_angle += 30
+            elif relative_angle > self.args.turn_angle:
+                action = 3  # Right
+            elif relative_angle < -self.args.turn_angle:
+                action = 2  # Left
+            elif relative_angle > self.args.turn_angle / 2.:
+                action = 7  # Right
+            elif relative_angle < -self.args.turn_angle / 2.:
+                action = 6  # Left
+            else:
+                action = 1  # Forward
+        
+        # print("action:",action)
+
+        return action
+
+    def _get_stg(self, grid, start, goal, planning_window):
+        """Get short-term goal"""
+
+        [gx1, gx2, gy1, gy2] = planning_window
+
+        x1, y1, = 0, 0
+        x2, y2 = grid.shape
+
+        # print("grid: ", grid.shape)
+
+        def add_boundary(mat, value=1):
+            h, w = mat.shape
+            new_mat = np.zeros((h + 2, w + 2)) + value
+            new_mat[1:h + 1, 1:w + 1] = mat
+            return new_mat
+
+        traversible = skimage.morphology.binary_dilation(
+            grid[x1:x2, y1:y2],
+            self.selem) != True
+        # traversible = grid[x1:x2, y1:y2] != True
+        traversible[self.collision_map[gx1:gx2, gy1:gy2]
+                    [x1:x2, y1:y2] == 1] = 0
+        traversible[cv2.dilate(self.visited_vis[gx1:gx2, gy1:gy2][x1:x2, y1:y2], self.kernel) == 1] = 1
+
+        traversible[int(start[0] - x1) - 1:int(start[0] - x1) + 2,
+                    int(start[1] - y1) - 1:int(start[1] - y1) + 2] = 1
+
+        traversible = add_boundary(traversible)
+        goal = add_boundary(goal, value=0)
+
+        planner = FMMPlanner(traversible)
+        selem = skimage.morphology.disk(10)
+        goal = skimage.morphology.binary_dilation(
+            goal, selem) != True
+        goal = 1 - goal * 1.
+        planner.set_multi_goal(goal)
+
+        state = [start[0] - x1 + 1, start[1] - y1 + 1]
+        stg_x, stg_y, replan, stop = planner.get_short_term_goal(state)
+
+        if replan:
+            self.replan_count += 1
+            print("false: ", self.replan_count)
+        else:
+            self.replan_count = 0
+
+        stg_x, stg_y = stg_x + x1 - 1, stg_y + y1 - 1
+
+        return (stg_x, stg_y), stop
+
+    def _preprocess_obs(self, obs, use_seg=True):
+        args = self.args
+        # print("obs: ", obs.shape)
+        obs = obs.transpose(1, 2, 0)
+        rgb = obs[:, :, :3]
+        depth = obs[:, :, 3:4]
+        semantic = obs[:,:,4:5].squeeze()
+
+        # BGR to RGB
+        self.rgb_vis = cv2.resize(cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB),
+                                  (640, 480), interpolation=cv2.INTER_NEAREST)
+        # print("obs: ", semantic.shape)
+        if args.use_gtsem:
+            self.semantics_vis = self.rgb_vis
+            sem_seg_pred = np.zeros((rgb.shape[0], rgb.shape[1], 15 + 1))
+            for i in range(16):
+                sem_seg_pred[:,:,i][semantic == i+1] = 1
+        else: 
+            semantic_output = self._get_sem_pred(
+                rgb.astype(np.uint8), depth, use_seg=use_seg)
+            sam_semantic_pred = semantic_output['sam_semantic_pred']
+            sam_all_cls = convert_SAM(sam_semantic_pred, self.object_category)
+            sem_seg_pred = sam_all_cls
+
+        depth = self._preprocess_depth(depth, args.min_depth, args.max_depth)
+
+        ds = args.env_frame_width // args.frame_width  # Downscaling factor
+        if ds != 1:
+            rgb = np.asarray(self.res(rgb.astype(np.uint8)))
+            depth = depth[ds // 2::ds, ds // 2::ds]
+            sem_seg_pred = sem_seg_pred[ds // 2::ds, ds // 2::ds]
+
+        depth = np.expand_dims(depth, axis=2)
+        state = np.concatenate((rgb, depth, sem_seg_pred),
+                               axis=2).transpose(2, 0, 1)
+
+        return state
+
+    def _preprocess_obs_rednet(self, obs, use_seg=True):
+        args = self.args
+        # print("obs: ", obs.shape)
+        obs = obs.transpose(1, 2, 0)
+        rgb = obs[:, :, :3]
+        depth = obs[:, :, 3:4]
+
+        red_semantic_pred, semantic_pred = self._get_sem_pred_rednet(
+            rgb.astype(np.uint8), depth, use_seg=use_seg)
+
+        sem_seg_pred = np.zeros((rgb.shape[0], rgb.shape[1], 15 + 1))   
+        for i in range(0, 15):
+            # print(mp_categories_mapping[i])
+            sem_seg_pred[:,:,i][red_semantic_pred == mp_categories_mapping[i]] = 1
+
+        sem_seg_pred[:,:,0][semantic_pred[:,:,0] == 0] = 0
+        sem_seg_pred[:,:,1][semantic_pred[:,:,1] == 0] = 0
+        sem_seg_pred[:,:,2][semantic_pred[:,:,2] == 1] = 1
+        sem_seg_pred[:,:,3][semantic_pred[:,:,3] == 0] = 0
+        sem_seg_pred[:,:,4][semantic_pred[:,:,4] == 1] = 1
+        sem_seg_pred[:,:,5][semantic_pred[:,:,5] == 1] = 1
+        # sem_seg_pred = self._get_sem_pred(
+        #     rgb.astype(np.uint8), depth, use_seg=use_seg)
+
+        depth = self._preprocess_depth(depth, args.min_depth, args.max_depth)
+
+        ds = args.env_frame_width // args.frame_width  # Downscaling factor
+        if ds != 1:
+            rgb = np.asarray(self.res(rgb.astype(np.uint8)))
+            depth = depth[ds // 2::ds, ds // 2::ds]
+            sem_seg_pred = sem_seg_pred[ds // 2::ds, ds // 2::ds]
+
+        depth = np.expand_dims(depth, axis=2)
+        state = np.concatenate((rgb, depth, sem_seg_pred),
+                               axis=2).transpose(2, 0, 1)
+
+        return state
+
+    def _preprocess_depth(self, depth, min_d, max_d):
+        # print("depth origin: ", depth.shape)
+        depth = depth[:, :, 0] * 1
+
+        for i in range(depth.shape[1]):
+            depth[:, i][depth[:, i] == 0.] = depth[:, i].max()
+
+        mask2 = depth > 0.99
+        depth[mask2] = 0.
+
+        mask1 = depth == 0
+        depth[mask1] = 100.0
+        depth = min_d * 100.0 + (max_d-min_d) * depth * 100.0
+        # depth = depth*1000.
+
+        return depth
+
+    def _get_sem_pred(self, rgb, depth, use_seg=True):
+        if use_seg:
+            # # save rgb and depth
+            # skimage.io.imsave("current_rgb.png", rgb)
+            # skimage.io.imsave("current_depth.png", (np.repeat(depth, 3, axis=2) * 255).astype(np.uint8))
+            
+            self.semantics_vis = None
+            image = torch.from_numpy(rgb).to(self.device).unsqueeze_(0).float()
+            depth = torch.from_numpy(depth).to(self.device).unsqueeze_(0).float()
+            with torch.no_grad():
+                # print(image.shape, depth.shape) # torch.Size([1, 480, 640, 3]) torch.Size([1, 480, 640, 1])
+                try:
+                    rgb_Image = Image.fromarray(rgb).convert('RGB')
+                    
+                    sam_semantic_pred = self.GSAM.predict(rgb_Image) # (N, 1, 480, 640), we need (480, 640, 16)
+                    self.semantics_vis = self.GSAM.get_vis(rgb_Image, sam_semantic_pred)
+                    # plt.figure(figsize=(10, 10))
+                    # for mask in sam_semantic_pred[0]:
+                    #     show_mask(mask.cpu().numpy(), plt.gca(), random_color=True)
+                    # for box, label in zip(sam_semantic_pred[1], sam_semantic_pred[2]):
+                    #     show_box(box.numpy(), plt.gca(), label)
+                    # output_dir = "./tmp_panorama/"
+                    # plt.axis('off')
+                    # plt.savefig(
+                    #     os.path.join(output_dir, f"grounded_sam_output_{self.t}.jpg"), 
+                    #     bbox_inches="tight", dpi=300, pad_inches=0.0
+                    # )
+                    # self.t += 1
+                    # save_mask_data("Grounded_SAM/output_sam/", sam_semantic_pred[0], sam_semantic_pred[1], sam_semantic_pred[2])
+                except Exception as ex:
+                    print(f"[SAM]: no object detected: {ex}")
+                    sam_semantic_pred = None
+                    
+                if self.semantics_vis is None:
+                    self.semantics_vis = self.rgb_vis
+        else:
+            raise NotImplementedError
+        outputs = {
+            "sam_semantic_pred": sam_semantic_pred,
+        }
+        return outputs
+    
+    def _get_sem_pred_rednet(self, rgb, depth, use_seg=True):
+        if use_seg:
+            image = torch.from_numpy(rgb).to(self.device).unsqueeze_(0).float()
+            depth = torch.from_numpy(depth).to(self.device).unsqueeze_(0).float()
+            red_semantic_pred = self.red_sem_pred(image, depth).squeeze().cpu().detach().numpy()
+
+            semantic_pred, self.rgb_vis = self.sem_pred.get_prediction(rgb)
+            semantic_pred = semantic_pred.astype(np.float32)
+        else:
+            semantic_pred = np.zeros((rgb.shape[0], rgb.shape[1], 16))
+            self.rgb_vis = rgb[:, :, ::-1]
+        return red_semantic_pred, semantic_pred
+
+    def get_pose_change(self, gps, compass):
+        """Returns dx, dy, do pose change of the agent relative to the last
+        timestep."""
+        # print("gps: ", gps)
+        # print("compass: ", compass)
+        curr_sim_pose = [gps[0],-gps[1], compass[0]]
+        dx, dy, do = pu.get_rel_pose_change(
+            curr_sim_pose, self.last_sim_location)
+        self.last_sim_location = curr_sim_pose
+        return dx, dy, do
+
+    def find_big_connect(self, image):
+        img_label, num = measure.label(image, return_num=True)#输出二值图像中所有的连通域
+        props = measure.regionprops(img_label)#输出连通域的属性，包括面积等
+        # print("img_label.shape: ", img_label.shape) # 480*480
+        resMatrix = np.zeros(img_label.shape)
+        tmp_area = 0
+        for i in range(0, len(props)):
+            if props[i].area > tmp_area:
+                tmp = (img_label == i + 1).astype(np.uint8)
+                resMatrix = tmp
+                tmp_area = props[i].area 
+        
+        return resMatrix
+
+    def remove_small_points(self, local_ob_map, image, threshold_point, pose):
+        # print("goal_cat_id: ", goal_cat_id)
+        # print("sem: ", sem.shape)
+        selem = skimage.morphology.disk(1)
+        traversible = skimage.morphology.binary_dilation(
+            local_ob_map, selem) != True
+        # traversible = 1 - traversible
+        planner = FMMPlanner(traversible)
+        goal_pose_map = np.zeros((local_ob_map.shape))
+        pose_x = int(pose[0].cpu()) if int(pose[0].cpu()) < self.local_w-1 else self.local_w-1
+        pose_y = int(pose[1].cpu()) if int(pose[1].cpu()) < self.local_w-1 else self.local_w-1
+        goal_pose_map[pose_x, pose_y] = 1
+        # goal_map = skimage.morphology.binary_dilation(
+        #     goal_pose_map, selem) != True
+        # goal_map = 1 - goal_map
+        planner.set_multi_goal(goal_pose_map)
+
+        img_label, num = measure.label(image, connectivity=2, return_num=True)#输出二值图像中所有的连通域
+        props = measure.regionprops(img_label)#输出连通域的属性，包括面积等
+        # print("img_label.shape: ", img_label.shape) # 480*480
+        # print("img_label.dtype: ", img_label.dtype) # 480*480
+        Goal_edge = np.zeros((img_label.shape[0], img_label.shape[1]))
+        Goal_point = np.zeros(img_label.shape)
+        dict_cost = {}
+        for i in range(1, len(props)):
+            # print("area: ", props[i].area)
+            # dist = pu.get_l2_distance(props[i].centroid[0], pose[0], props[i].centroid[1], pose[1])
+            dist = planner.fmm_dist[int(props[i].centroid[0]), int(props[i].centroid[1])] * 5
+            # dist_s = 8 if dist < 300 else 0
+            
+            cost = dist
+
+            if props[i].area > threshold_point and dist > 50 and dist < 500:
+                dict_cost[i] = cost
+        
+        if dict_cost:
+            dict_cost = sorted(dict_cost.items(), key=lambda x: x[1], reverse=False)
+            
+            # print(dict_cost)
+            for i, (key, value) in enumerate(dict_cost):
+                # print(i, key)
+                Goal_edge[img_label == key + 1] = 1
+                Goal_point[int(props[key].centroid[0]), int(props[key].centroid[1])] = i+1 #
+                if i == 3:
+                    break
+
+        return Goal_edge, Goal_point
+
+    def get_local_map_boundaries(self, agent_loc, local_sizes, full_sizes):
+        loc_r, loc_c = agent_loc
+        local_w, local_h = local_sizes
+        full_w, full_h = full_sizes
+
+        if self.args.global_downscaling > 1:
+            gx1, gy1 = loc_r - local_w // 2, loc_c - local_h // 2
+            gx2, gy2 = gx1 + local_w, gy1 + local_h
+            if gx1 < 0:
+                gx1, gx2 = 0, local_w
+            if gx2 > full_w:
+                gx1, gx2 = full_w - local_w, full_w
+
+            if gy1 < 0:
+                gy1, gy2 = 0, local_h
+            if gy2 > full_h:
+                gy1, gy2 = full_h - local_h, full_h
+        else:
+            gx1, gx2, gy1, gy2 = 0, full_w, 0, full_h
+
+        return [gx1, gx2, gy1, gy2]
+
+    def init_map_and_pose(self):
+        self.full_map.fill_(0.)
+        self.full_pose.fill_(0.)
+        self.full_pose[:2] = self.args.map_size_cm / 100.0 / 2.0
+
+        locs = self.full_pose.cpu().numpy()
+        self.planner_pose_inputs[:3] = locs
+        r, c = locs[1], locs[0]
+        loc_r, loc_c = [int(r * 100.0 / self.args.map_resolution),
+                        int(c * 100.0 / self.args.map_resolution)]
+
+        self.full_map[2:4, loc_r - 1:loc_r + 2, loc_c - 1:loc_c + 2] = 1.0
+
+
+        self.lmb = self.get_local_map_boundaries((loc_r, loc_c),
+                                            (self.local_w, self.local_h),
+                                            (self.full_w, self.full_h))
+
+        self.planner_pose_inputs[3:] = self.lmb
+        self.origins = [self.lmb[2] * self.args.map_resolution / 100.0,
+                    self.lmb[0] * self.args.map_resolution / 100.0, 0.]
+
+        self.local_map = self.full_map[:,
+                                self.lmb[0]:self.lmb[1],
+                                self.lmb[2]:self.lmb[3]]
+        self.local_pose = self.full_pose - \
+            torch.from_numpy(np.array(self.origins)).to(self.device).float()
+
+        self.local_ob_map = np.zeros((self.local_w,
+                                self.local_h))
+
+        self.local_ex_map = np.zeros((self.local_w,
+                                self.local_h))
+
+        self.target_edge_map = np.zeros((self.local_w,
+                                self.local_h))
+
+        self.target_point_map = np.zeros((self.local_w,
+                                self.local_h))
+
+    def get_frontier_boundaries(self, frontier_loc, frontier_sizes, map_sizes):
+        loc_r, loc_c = frontier_loc
+        local_w, local_h = frontier_sizes
+        full_w, full_h = map_sizes
+
+        gx1, gy1 = loc_r - local_w // 2, loc_c - local_h // 2
+        gx2, gy2 = gx1 + local_w, gy1 + local_h
+        if gx1 < 0:
+            gx1, gx2 = 0, local_w
+        if gx2 > full_w:
+            gx1, gx2 = full_w - local_w, full_w
+
+        if gy1 < 0:
+            gy1, gy2 = 0, local_h
+        if gy2 > full_h:
+            gy1, gy2 = full_h - local_h, full_h
+ 
+        return [int(gx1), int(gx2), int(gy1), int(gy2)]
+
+    def _visualize(self, inputs, action):
+        args = self.args
+        dump_dir = "{}/dump/{}/".format(args.dump_location,
+                                        args.exp_name)
+        ep_dir = '{}/episodes/eps_{}/'.format(
+            dump_dir, self.l_step)
+        if not os.path.exists(ep_dir):
+            os.makedirs(ep_dir)
+
+        local_w = inputs['map_pred'].shape[0]
+
+        map_pred = inputs['map_pred']
+        exp_pred = inputs['exp_pred']
+        map_edge = inputs['map_edge']
+        start_x, start_y, start_o, gx1, gx2, gy1, gy2 = inputs['pose_pred']
+
+        goal = inputs['goal']
+        sem_map = inputs['sem_map_pred']
+
+        gx1, gx2, gy1, gy2 = int(gx1), int(gx2), int(gy1), int(gy2)
+
+        sem_map += 5
+
+        no_cat_mask = sem_map == 20
+        map_mask = np.rint(map_pred) == 1
+        exp_mask = np.rint(exp_pred) == 1
+        vis_mask = self.visited_vis[gx1:gx2, gy1:gy2] == 1
+        edge_mask = map_edge == 1
+
+        sem_map[no_cat_mask] = 0
+        m1 = np.logical_and(no_cat_mask, exp_mask)
+        sem_map[m1] = 2
+
+        m2 = np.logical_and(no_cat_mask, map_mask)
+        sem_map[m2] = 1
+
+        sem_map[vis_mask] = 3
+        sem_map[edge_mask] = 3
+
+        selem = skimage.morphology.disk(4)
+        goal_mat = 1 - skimage.morphology.binary_dilation(
+            goal, selem) != True
+
+        goal_mask = goal_mat == 1
+        sem_map[goal_mask] = 4
+        if np.sum(goal) == 1:
+            f_pos = np.argwhere(goal == 1)
+            # fmb = get_frontier_boundaries((f_pos[0][0], f_pos[0][1]))
+            # goal_fmb = skimage.draw.circle_perimeter(int((fmb[0]+fmb[1])/2), int((fmb[2]+fmb[3])/2), 23)
+            goal_fmb = skimage.draw.circle_perimeter(f_pos[0][0], f_pos[0][1], int(local_w/8 -1))
+            goal_fmb[0][goal_fmb[0] > local_w-1] = local_w-1
+            goal_fmb[1][goal_fmb[1] > local_w-1] = local_w-1
+            goal_fmb[0][goal_fmb[0] < 0] = 0
+            goal_fmb[1][goal_fmb[1] < 0] = 0
+            # goal_fmb[goal_fmb < 0] =0
+            goal_mask[goal_fmb[0], goal_fmb[1]] = 1
+            sem_map[goal_mask] = 4
+
+
+        color_pal = [int(x * 255.) for x in color_palette]
+        sem_map_vis = Image.new("P", (sem_map.shape[1],
+                                      sem_map.shape[0]))
+        sem_map_vis.putpalette(color_pal)
+        sem_map_vis.putdata(sem_map.flatten().astype(np.uint8))
+        sem_map_vis = sem_map_vis.convert("RGB")
+        sem_map_vis = np.flipud(sem_map_vis)
+
+        sem_map_vis = sem_map_vis[:, :, [2, 1, 0]]
+        sem_map_vis = cv2.resize(sem_map_vis, (480, 480),
+                                 interpolation=cv2.INTER_NEAREST)
+
+        self.vis_image = vu.init_vis_image(self.goal_name, str(action))
+
+        self.vis_image[50:530, 15:655] = self.rgb_vis
+        self.vis_image[50:530, 670:1150] = sem_map_vis
+
+        pos = (
+            (start_x * 100. / args.map_resolution - gy1)
+            * 480 / map_pred.shape[0],
+            (map_pred.shape[1] - start_y * 100. / args.map_resolution + gx1)
+            * 480 / map_pred.shape[1],
+            np.deg2rad(-start_o)
+        )
+
+        agent_arrow = vu.get_contour_points(pos, origin=(670, 50), size=10)
+        color = (int(color_palette[11] * 255),
+                 int(color_palette[10] * 255),
+                 int(color_palette[9] * 255))
+        cv2.drawContours(self.vis_image, [agent_arrow], 0, color, -1)
+
+        if args.visualize:
+            # Displaying the image
+            cv2.imshow("episode_n {} agent_{}".format(self.episode_n, self.agent_id), self.vis_image)
+            cv2.waitKey(1)
+
+        # if args.print_images:
+        #     fn = '{}/episodes/eps_{}/agent-{}-Vis-{}.png'.format(
+        #         dump_dir, self.episode_n,
+        #         self.agent_id, self.l_step)
+        #     cv2.imwrite(fn, self.vis_image)
+    
+    def get_spl(self, success, cur_loc):
+        """This function computes evaluation metrics for the Object Goal task
+
+        Returns:
+            spl (float): Success weighted by Path Length
+                        (See https://arxiv.org/pdf/1807.06757.pdf)
+            success (int): 0: Failure, 1: Successful
+            dist (float): Distance to Success (DTS),  distance of the agent
+                        from the success threshold boundary in meters.
+                        (See https://arxiv.org/pdf/2007.00643.pdf)
+        """
+        # print("self.Start_Location:",self.Start_Location)
+        # print("cur_loc:",cur_loc)
+        # print("self.Path_Length:",self.Path_Length)
+        starting_distance = pu.get_l2_distance(self.Start_Location[0],cur_loc[0],self.Start_Location[1],cur_loc[1])
+        spl = min(success * starting_distance / self.Path_Length, 1)
+        return spl
