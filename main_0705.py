@@ -592,11 +592,19 @@ def Decision_Generation_Vis(args, agents_seg_list, agent_j, episode_n, l_step, p
     beta = [chr(ord("a") + i) for i in range(26)]
     alpha0 = 0
     if len(history_nodes) > 0:
-        for hs in history_nodes:
+        for hs in history_nodes[:26]:
             centroid_x = int(hs[0])
             centroid_y = int(hs[1])
             cv2.circle(sem_map_vis, (centroid_y, d240(centroid_x)), 5, color_green, -1)
             label = f"{beta[alpha0]}"
+            alpha0 += 1
+            cv2.putText(sem_map_vis, label, (centroid_y + 5, d240(centroid_x) + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_green, 1)
+        alpha0 = 0
+        for hs in history_nodes[26:]:
+            centroid_x = int(hs[0])
+            centroid_y = int(hs[1])
+            cv2.circle(sem_map_vis, (centroid_y, d240(centroid_x)), 5, color_green, -1)
+            label = f"{alpha[alpha0]}"
             alpha0 += 1
             cv2.putText(sem_map_vis, label, (centroid_y + 5, d240(centroid_x) + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_green, 1)
     # 遍历字典并绘制多边形
@@ -780,7 +788,7 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    device = torch.device("cuda:0" if args.cuda else "cpu")
+    device = torch.device("cuda:1" if args.cuda else "cpu")
 
     # logging.info(f"stride:{stride}")
     # logging.info(f"names:{names}")
@@ -861,7 +869,24 @@ def main():
     # print("num_episodes:",num_episodes)# 1000
 
     agg_metrics: Dict = defaultdict(float)
-    agg_metrics['success_rate'] = 0
+    obj_SR: Dict = defaultdict(float)
+    if 'objectnav_mp3d' in args.task_config:
+        for category in object_category:
+            obj_SR[category] = 0
+            obj_SR['num_'+category] = 0
+    elif 'objectnav_hm3d' in args.task_config:
+        for category in category_to_id:
+            obj_SR[category] = 0
+            obj_SR['num_'+category] = 0
+
+    agg_metrics['multi_SR'] = 0
+    agg_metrics['SPL'] = 0
+    agg_metrics['SoftSPL'] = 0
+    agg_metrics['multi_SPL'] = {}
+    agg_metrics['multi_SoftSPL'] = {}
+    for i in range(num_agents):
+        agg_metrics['multi_SPL'][f'Agent_{i}'] = 0
+        agg_metrics['multi_SoftSPL'][f'Agent_{i}'] = 0
 
     count_episodes = 0
     count_step = 0
@@ -1513,6 +1538,7 @@ def main():
             # logging.info(f"full_map_pred.shape: {full_map_pred.shape}") # [20,480,480] HM-3D
         
         count_episodes += 1
+        obj_SR['num_'+agent[0].goal_name] += 1
         count_step += agent[0].l_step
 
         # ------------------------------------------------------------------
@@ -1526,28 +1552,57 @@ def main():
             "num timesteps {},".format(count_step),
             "FPS {},".format(int(count_step / (log_end - log_start)))
         ]) + '\n'
-
-        metrics = env.get_metrics()
-        for m, v in metrics.items():
-            if isinstance(v, dict):
-                for sub_m, sub_v in v.items():
-                    agg_metrics[m + "/" + str(sub_m)] += sub_v
-            else:
-                agg_metrics[m] += v
         
         for k, v in agg_metrics.items():
-            if k == 'success_rate':
+            if k == 'multi_SR':
                 for i in range(num_agents):
                     if agent[i].Find_Goal:
                         agg_metrics[k] += 1
+                        obj_SR[agent[0].goal_name] += 1
                         if agg_metrics[k] > count_episodes:
                             agg_metrics[k] = count_episodes
+                        if obj_SR[agent[0].goal_name] > obj_SR['num_'+agent[0].goal_name]:
+                            obj_SR[agent[0].goal_name] = obj_SR['num_'+agent[0].goal_name]
                         break
+        spls = []
+        for i in range(num_agents):
+            start_x, start_y, start_o, gx1, gx2, gy1, gy2 = agent[i].planner_pose_inputs
+            r, c = start_y, start_x
+            start = [int(r * 100.0 / args.map_resolution - gx1),
+            int(c * 100.0 / args.map_resolution - gy1)]
+            start = pu.threshold_poses(start, agent[i].local_map[0, :, :].cpu().numpy().shape)
+            if agent[i].Find_Goal:
+                spl = agent[i].get_spl(success=1,cur_loc=start)
+            else:
+                spl = agent[i].get_spl(success=0,cur_loc=start)
+            agg_metrics['multi_SPL'][f'Agent_{i}'] = spl
+            agg_metrics['multi_SoftSPL'][f'Agent_{i}'] += spl
+            spls.append(spl)
+        agg_metrics['SPL'] = max(spls)
+        agg_metrics['SoftSPL'] += max(spls)
+        for agent_name, SPL in agg_metrics['multi_SPL'].items():
+            SoftSPL = agg_metrics['multi_SoftSPL'][agent_name] / count_episodes
+            log += f"{agent_name}" + "---SPL: {:.3f}, SoftSPL: {:.3f}".format(SPL, SoftSPL)
+            log += '\n'
 
+        if 'objectnav_mp3d' in args.task_config:
+            for category in object_category:
+                if category == agent[0].goal_name:
+                    log += category + ": {:.3f}, ".format(obj_SR[category] / obj_SR['num_'+category])
+                else:
+                    log += category + ": {:.3f}, ".format(obj_SR[category])
+        elif 'objectnav_hm3d' in args.task_config:
+            for category in category_to_id:
+                if category == agent[0].goal_name:
+                    log += category + ": {:.3f}, ".format(obj_SR[category] / obj_SR['num_'+category])
+                else:
+                    log += category + ": {:.3f}, ".format(obj_SR[category])
+        log += '\n'
 
-
-        log += ", ".join(k + ": {:.3f}".format(v / count_episodes) for k, v in agg_metrics.items() if k !='success') + " ---({:.0f}/{:.0f})".format(count_episodes, num_episodes)
-
+        log += "multi_SR: {:.3f}, ".format(agg_metrics['multi_SR'] / count_episodes)
+        log += "multi_SPL: {:.3f}, ".format(agg_metrics['SPL'])
+        log += "multi_SoftSPL: {:.3f} ".format(agg_metrics['SoftSPL'] / count_episodes)
+        log += " ---({:.0f}/{:.0f})".format(count_episodes, num_episodes)
         # log += "Total usage: " + str(sum(total_usage)) + ", average usage: " + str(np.mean(total_usage))
         print(log)
         logging.info(log)
