@@ -99,12 +99,13 @@ MCoCoNav/
         val_mini/
 ```
 
+## Evaluation
+### Start the VLM server:
+```
+python glm4_openai_api_demo_multi_gpus.py
+```
 
-## Eval HM3D_v0.2 2-robot: 
+### Eval HM3D_v0.2 2-robot: 
 ```
 python main.py -d ./VLM_EXP/multi_hm3d_2-robot/  --num_agents 2 --task_config tasks/multi_objectnav_hm3d.yaml
-```
-## Eval MP3D 2-robot: 
-```
-python main.py -d ./VLM_EXP/multi_mp3d_2-robot/ --num_agents 2 --num_sem_categories 21 --task_config tasks/multi_objectnav_mp3d.yaml
 ```
